@@ -848,12 +848,22 @@ async function startNativeBarcodeCamera(){
       }catch(e){/* transient decode errors are normal between frames */}
     },400);
   }catch(e){
+    reportClientError('Native barcode camera failed: '+e.name+' '+e.message,e.stack);
     if(ui.barcodeScanModal){
       ui.barcodeScanModal.status='manual';
-      ui.barcodeScanModal.err='Couldn\'t access the camera — you can still enter the barcode number below.';
+      ui.barcodeScanModal.err=cameraErrorMessage(e);
       renderModal();
     }
   }
+}
+function cameraErrorMessage(e){
+  if(e&&(e.name==='NotAllowedError'||e.name==='SecurityError')){
+    return 'Camera access is blocked for this site. Tap the "aA" icon (or lock icon) in your browser\'s address bar → Website Settings, allow Camera, then try again. You can still enter the barcode number below.';
+  }
+  if(e&&e.name==='NotFoundError'){
+    return 'No camera was found on this device — you can still enter the barcode number below.';
+  }
+  return 'Couldn\'t start the camera scanner — you can still enter the barcode number below.';
 }
 async function startZXingBarcodeCamera(){
   const video=document.getElementById('barcode-video');
@@ -867,9 +877,10 @@ async function startZXingBarcodeCamera(){
       if(result) handleBarcodeDetected(result.getText());
     });
   }catch(e){
+    reportClientError('ZXing barcode camera failed: '+e.name+' '+e.message,e.stack);
     if(ui.barcodeScanModal){
       ui.barcodeScanModal.status='manual';
-      ui.barcodeScanModal.err='Couldn\'t start the camera scanner — you can still enter the barcode number below.';
+      ui.barcodeScanModal.err=cameraErrorMessage(e);
       renderModal();
     }
   }
@@ -2035,6 +2046,12 @@ function renderPlannerModalBody(){
 
 function renderModal(){
   const root=document.getElementById('modal-root');
+  // The persistent barcode video (see its markup comment) may currently be parked
+  // inside root from a previous barcode-scanning render. root.innerHTML=... below
+  // would destroy it (not just hide it) if it's still in there, permanently
+  // breaking every scan attempt after the first — reclaim it to <body> first.
+  const parkedVideo=document.getElementById('barcode-video');
+  if(parkedVideo&&root.contains(parkedVideo)) document.body.appendChild(parkedVideo);
   if(ui.plannerModal){ root.innerHTML=renderChooseRecipeModal(); }
   else if(ui.recipeViewModal){ root.innerHTML=renderRecipeViewModal(); }
   else if(ui.assignModal){ root.innerHTML=renderAssignModal(); }
@@ -2527,8 +2544,11 @@ function renderBarcodeScanModal(){
   } else if(m.status==='looking-up'){
     body='<div class="status-card"><div class="spinner" style="margin:0 auto 12px;"></div>Looking that up…</div>';
   } else if(m.status==='not-found'){
-    body='<div class="error-card" style="margin-bottom:12px;">Couldn\'t find that product. You can still add it manually.</div>'+
-      '<button type="button" class="btn btn-primary" data-action="barcode-not-found-continue" style="width:100%;">Continue manually</button>';
+    body='<div class="error-card" style="margin-bottom:12px;">Couldn\'t find that product in the barcode database — this happens for smaller/regional brands. You can still add it manually, or try a photo instead.</div>'+
+      '<div style="display:flex;flex-direction:column;gap:8px;">'+
+        '<button type="button" class="btn btn-primary" data-action="barcode-not-found-try-photo">📸 Try a photo instead</button>'+
+        '<button type="button" class="btn btn-secondary" data-action="barcode-not-found-continue">Continue manually</button>'+
+      '</div>';
   } else { // manual
     body=(m.err?'<div class="error-card" style="margin-bottom:12px;">'+h(m.err)+'</div>':'')+
       '<div class="field" style="margin-bottom:12px;"><label>Barcode number</label><input id="barcode-manual-input" inputmode="numeric" placeholder="e.g. 3017620422003" autofocus></div>'+
@@ -4650,6 +4670,11 @@ document.addEventListener('click',e=>{
     case 'barcode-not-found-continue':{
       const target=ui.barcodeScanModal?ui.barcodeScanModal.target:'kitchen';
       openScanResult({target});
+    }break;
+    case 'barcode-not-found-try-photo':{
+      const target=ui.barcodeScanModal?ui.barcodeScanModal.target:'kitchen';
+      stopBarcodeCamera();ui.barcodeScanModal=null;
+      triggerPhotoIdentify(target);
     }break;
     case 'open-photo-identify': triggerPhotoIdentify(a.target);break;
     case 'close-photo-identify': ui.photoIdentifyModal=null;renderModal();break;
