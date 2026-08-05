@@ -345,6 +345,11 @@ input::placeholder,textarea::placeholder{color:var(--ink-soft);}
 <div id="app"></div>
 <div id="modal-root"></div>
 <div id="cooking-modal-root"></div>
+<!-- Persistent — never touched by render()'s innerHTML replacement, so a live
+     camera stream / file picker survives across re-renders. Moved into a modal's
+     placeholder slot via appendChild (which relocates, not clones) when needed. -->
+<video id="barcode-video" playsinline muted style="display:none;width:100%;border-radius:12px;background:#000;"></video>
+<input type="file" id="photo-file-input" accept="image/*" capture="environment" style="display:none;">
 <script>
 // ─── CONSTANTS ────────────────────────────────────────────────────────────
 const LOCATIONS = ['Fridge','Freezer','Pantry','Counter'];
@@ -591,6 +596,7 @@ function isSafeToApplyBackgroundUpdate(){
   // isn't synced to `ui` until submit, and a full re-render would wipe it silently.
   if(ui.plannerModal||ui.assignModal||ui.recipeViewModal||ui.cookingModal) return false;
   if(ui.showAddItem||ui.editingItemId||ui.showAddGrocery||ui.showAddCookbook||ui.browserShowAddForm) return false;
+  if(ui.barcodeScanModal||ui.photoIdentifyModal||ui.scanResultModal) return false;
   if(ui.editCatId) return false;
   const active=document.activeElement;
   if(active&&/^(INPUT|TEXTAREA|SELECT)$/.test(active.tagName)) return false;
@@ -667,6 +673,9 @@ let ui={
   adminFamilies:[], adminLoaded:false, newInviteCode:'', newInviteExpires:'', newInviteLoading:false,
   householdDetailModal:null, householdDetailLoading:false, // {family, members, state}
   adminDeleteFamilyModal:null, // {id, name, password, confirmText, loading, err}
+  barcodeScanModal:null, // {target, status:'scanning'|'manual'|'looking-up'|'not-found', manualCode, err}
+  photoIdentifyModal:null, // {loading, err}
+  scanResultModal:null, // {name, category, quantity, unit, target:'kitchen'|'grocery'}
   accountMsg:'', accountErr:'', emailMsg:'', emailErr:'',
   billingHistory:[], billingLoaded:false,
   collapsedGroups:new Set(),
@@ -781,6 +790,190 @@ function deleteItem(id){state.inventory=state.inventory.filter(i=>i.id!==id);sav
 function adjustQty(id,delta){
   const item=state.inventory.find(i=>i.id===id);if(!item)return;
   item.quantity=Math.max(0,(Number(item.quantity)||0)+delta);saveInv();render();
+}
+
+// ─── ACTIONS: SCAN & IDENTIFY ─────────────────────────────────────────────
+// Barcode scanning uses the persistent #barcode-video element (see comment near
+// its markup) so the live camera stream survives this app's innerHTML-based
+// re-renders. Photo identify reuses the existing /api/generate-recipe proxy —
+// it already forwards an arbitrary {system,messages} to Claude, which accepts
+// an image content block, so no backend change is needed for that path.
+const BARCODE_FORMATS=['ean_13','ean_8','upc_a','upc_e'];
+let barcodeDetectTimer=null;
+
+function openBarcodeScan(target){
+  const camSupported='BarcodeDetector' in window;
+  ui.barcodeScanModal={target,status:camSupported?'scanning':'manual',manualCode:'',err:''};
+  renderModal();
+  if(camSupported) startBarcodeCamera();
+}
+function closeBarcodeScan(){
+  stopBarcodeCamera();
+  ui.barcodeScanModal=null;
+  renderModal();
+}
+async function startBarcodeCamera(){
+  const video=document.getElementById('barcode-video');
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}});
+    if(!ui.barcodeScanModal){ stream.getTracks().forEach(t=>t.stop()); return; } // modal closed while awaiting permission
+    video.srcObject=stream;video.style.display='block';
+    await video.play();
+    const detector=new BarcodeDetector({formats:BARCODE_FORMATS});
+    barcodeDetectTimer=setInterval(async()=>{
+      if(!ui.barcodeScanModal||ui.barcodeScanModal.status!=='scanning') return;
+      try{
+        const codes=await detector.detect(video);
+        if(codes.length) handleBarcodeDetected(codes[0].rawValue);
+      }catch(e){/* transient decode errors are normal between frames */}
+    },400);
+  }catch(e){
+    if(ui.barcodeScanModal){
+      ui.barcodeScanModal.status='manual';
+      ui.barcodeScanModal.err='Couldn\'t access the camera — you can still enter the barcode number below.';
+      renderModal();
+    }
+  }
+}
+function stopBarcodeCamera(){
+  if(barcodeDetectTimer){clearInterval(barcodeDetectTimer);barcodeDetectTimer=null;}
+  const video=document.getElementById('barcode-video');
+  if(video.srcObject){video.srcObject.getTracks().forEach(t=>t.stop());video.srcObject=null;}
+  video.style.display='none';
+}
+function handleBarcodeDetected(code){
+  stopBarcodeCamera();
+  if(!ui.barcodeScanModal) return;
+  ui.barcodeScanModal.status='looking-up';
+  renderModal();
+  lookupBarcode(code);
+}
+function switchToManualBarcode(){
+  if(!ui.barcodeScanModal) return;
+  stopBarcodeCamera();
+  ui.barcodeScanModal.status='manual';ui.barcodeScanModal.err='';
+  renderModal();
+}
+function submitManualBarcode(){
+  const code=(document.getElementById('barcode-manual-input')?.value||'').trim();
+  if(!code||!ui.barcodeScanModal) return;
+  ui.barcodeScanModal.status='looking-up';
+  renderModal();
+  lookupBarcode(code);
+}
+async function lookupBarcode(code){
+  const target=ui.barcodeScanModal?ui.barcodeScanModal.target:'kitchen';
+  try{
+    const res=await fetch('https://world.openfoodfacts.org/api/v2/product/'+encodeURIComponent(code)+'.json');
+    const data=await res.json();
+    if(data&&data.status===1&&data.product&&data.product.product_name){
+      const name=data.product.product_name;
+      openScanResult({name,category:getCat(guessCategory(name)).name,quantity:1,unit:'',target,emoji:guessItemEmoji(name)});
+      return;
+    }
+  }catch(e){/* fall through to not-found */}
+  if(ui.barcodeScanModal){
+    ui.barcodeScanModal.status='not-found';
+    renderModal();
+  }
+}
+
+function openScanResult(prefill){
+  ui.barcodeScanModal=null;ui.photoIdentifyModal=null;
+  ui.scanResultModal={
+    name:prefill.name||'',category:prefill.category||getCat('').name,
+    quantity:prefill.quantity||1,unit:prefill.unit||'',
+    target:prefill.target||'kitchen',emoji:prefill.emoji||null,err:''
+  };
+  renderModal();
+}
+function closeScanResult(){ ui.scanResultModal=null; renderModal(); }
+function submitScanResult(){
+  const m=ui.scanResultModal;if(!m)return;
+  const name=(document.getElementById('scan-result-name')?.value||'').trim();
+  const quantityRaw=document.getElementById('scan-result-qty')?.value||'';
+  if(!name){ m.err='Name is required';renderModal();return; }
+  if(m.target==='kitchen'){
+    const unit=(document.getElementById('scan-result-unit')?.value||'').trim();
+    state.inventory.push({
+      id:uid(),name,category:m.category,location:'Fridge',
+      quantity:parseFloat(quantityRaw)||1,unit,threshold:0,
+      expiresOn:'',expiryMode:undefined,emoji:m.emoji||null
+    });
+    saveInv();
+  } else {
+    addGroceryItem(name,m.category,'',false,quantityRaw.trim());
+  }
+  ui.scanResultModal=null;
+  render();
+}
+
+let pendingPhotoTarget='kitchen';
+function triggerPhotoIdentify(target){
+  pendingPhotoTarget=target;
+  document.getElementById('photo-file-input').click();
+}
+function downscaleImageToBase64(file){
+  return new Promise((resolve,reject)=>{
+    const img=new Image();
+    const reader=new FileReader();
+    reader.onerror=()=>reject(new Error('Could not read file'));
+    reader.onload=()=>{
+      img.onerror=()=>reject(new Error('Could not read image'));
+      img.onload=()=>{
+        const maxEdge=800;
+        const scale=Math.min(1,maxEdge/Math.max(img.width,img.height));
+        const canvas=document.createElement('canvas');
+        canvas.width=Math.round(img.width*scale);
+        canvas.height=Math.round(img.height*scale);
+        canvas.getContext('2d').drawImage(img,0,0,canvas.width,canvas.height);
+        resolve(canvas.toDataURL('image/jpeg',0.8).split(',')[1]);
+      };
+      img.src=reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+async function handlePhotoFileChosen(e){
+  const file=e.target.files&&e.target.files[0];
+  e.target.value=''; // allow choosing the same file again later
+  if(!file) return;
+  ui.photoIdentifyModal={loading:true,err:''};
+  renderModal();
+  try{
+    const base64=await downscaleImageToBase64(file);
+    await identifyItemFromPhoto(base64);
+  }catch(err){
+    if(ui.photoIdentifyModal){ui.photoIdentifyModal.loading=false;ui.photoIdentifyModal.err='Couldn\'t read that photo — try again.';renderModal();}
+  }
+}
+async function identifyItemFromPhoto(base64){
+  const catNames=state.settings.categories.map(c=>c.name).join(', ');
+  const system='You are an item-identification assistant inside a home kitchen/pantry app called PantryPal. '+
+    'Given a photo of a single grocery or pantry item, identify it. Respond ONLY with a raw JSON object '+
+    '(no markdown, no commentary): {"name":string,"category":string,"quantity":number,"unit":string}. '+
+    '"category" must be exactly one of: '+catNames+'. "unit" should be a short common unit like "pcs","cans","g","lb","oz". '+
+    'If packaging text reveals a count/size, use it for quantity/unit, otherwise default quantity to 1 and unit to "pcs". '+
+    'If the photo doesn\'t clearly show a single identifiable food/grocery item, respond with {"name":"","category":"","quantity":1,"unit":""}.';
+  try{
+    const data=await api('POST','generate-recipe',{max_tokens:300,system,messages:[{role:'user',content:[
+      {type:'image',source:{type:'base64',media_type:'image/jpeg',data:base64}},
+      {type:'text',text:'Identify this kitchen/grocery item.'}
+    ]}]});
+    if(!data) throw new Error('request failed');
+    let text=(data.content||[]).find(b=>b.type==='text')?.text||'';
+    text=text.trim().replace(/^```json/i,'').replace(/^```/,'').replace(/```$/,'').trim();
+    const result=JSON.parse(text);
+    if(!result.name) throw new Error('not identified');
+    const category=state.settings.categories.some(c=>c.name===result.category)?result.category:getCat(guessCategory(result.name)).name;
+    openScanResult({name:result.name,category,quantity:Number(result.quantity)||1,unit:result.unit||'',target:pendingPhotoTarget,emoji:guessItemEmoji(result.name)});
+  }catch(e){
+    if(ui.photoIdentifyModal){
+      ui.photoIdentifyModal.loading=false;
+      ui.photoIdentifyModal.err=lastApiStatus===402?'You\'re out of AI credits. Buy more in Settings → Household & Account.':'Couldn\'t identify that item — try again or add it manually.';
+      renderModal();
+    }
+  }
 }
 
 // ─── ACTIONS: GROCERY ─────────────────────────────────────────────────────
@@ -1809,6 +2002,13 @@ function renderModal(){
   else if(ui.showAddItem){ root.innerHTML=renderItemFormModal(); }
   else if(ui.householdDetailModal){ root.innerHTML=renderHouseholdDetailModal(); }
   else if(ui.adminDeleteFamilyModal){ root.innerHTML=renderAdminDeleteFamilyModal(); }
+  else if(ui.barcodeScanModal){
+    root.innerHTML=renderBarcodeScanModal();
+    const slot=document.getElementById('barcode-video-slot'),video=document.getElementById('barcode-video');
+    if(slot&&video) slot.appendChild(video); // moves (not clones) — live stream survives
+  }
+  else if(ui.photoIdentifyModal){ root.innerHTML=renderPhotoIdentifyModal(); }
+  else if(ui.scanResultModal){ root.innerHTML=renderScanResultModal(); }
   else { root.innerHTML=''; return; }
   setTimeout(()=>{const el=document.getElementById('planner-search-input')||document.querySelector('#modal-root input[name="name"]');if(el)el.focus();},0);
 }
@@ -2112,7 +2312,9 @@ function renderLeftoversShelf(){
   '</div>';
 }
 function renderKitchen(){
-  const addBtn='<button class="btn btn-primary" data-action="open-add-item">+ Add item</button>';
+  const addBtn='<button class="btn btn-primary" data-action="open-add-item">+ Add item</button>'+
+    '<button class="btn btn-secondary" data-action="open-barcode-scan" data-target="kitchen">📷 Scan</button>'+
+    '<button class="btn btn-secondary" data-action="open-photo-identify" data-target="kitchen">📸 Photo</button>';
   const isAllActive = ui.kitchenLoc==='All' && ui.kitchenExpiry==='all';
   const allBtn='<button class="pill-btn '+(isAllActive?'active':'')+'" data-action="reset-kitchen-filters">All</button>';
   const locBtns=LOCATIONS.map(l=>
@@ -2272,6 +2474,76 @@ function renderLeftoverFormModal(){
   );
 }
 
+function renderBarcodeScanModal(){
+  const m=ui.barcodeScanModal;
+  let body;
+  if(m.status==='scanning'){
+    body='<div id="barcode-video-slot" style="margin-bottom:12px;"></div>'+
+      '<p style="font-size:12.5px;color:var(--ink-soft);font-weight:700;text-align:center;margin-bottom:10px;">Point your camera at a barcode.</p>'+
+      '<button type="button" class="btn-ghost" data-action="barcode-use-manual" style="display:block;margin:0 auto;">Enter the number instead</button>';
+  } else if(m.status==='looking-up'){
+    body='<div class="status-card"><div class="spinner" style="margin:0 auto 12px;"></div>Looking that up…</div>';
+  } else if(m.status==='not-found'){
+    body='<div class="error-card" style="margin-bottom:12px;">Couldn\'t find that product. You can still add it manually.</div>'+
+      '<button type="button" class="btn btn-primary" data-action="barcode-not-found-continue" style="width:100%;">Continue manually</button>';
+  } else { // manual
+    body=(m.err?'<div class="error-card" style="margin-bottom:12px;">'+h(m.err)+'</div>':'')+
+      '<div class="field" style="margin-bottom:12px;"><label>Barcode number</label><input id="barcode-manual-input" inputmode="numeric" placeholder="e.g. 3017620422003" autofocus></div>'+
+      '<button type="button" class="btn btn-primary" data-action="barcode-submit-manual" style="width:100%;">Look up</button>';
+  }
+  return (
+    '<div class="modal-overlay" id="pp-modal-overlay">'+
+      '<div class="modal-sheet">'+
+        '<button class="modal-close" data-action="close-barcode-scan">×</button>'+
+        '<div class="modal-title" style="margin-bottom:14px;">📷 Scan barcode</div>'+
+        body+
+      '</div>'+
+    '</div>'
+  );
+}
+function renderPhotoIdentifyModal(){
+  const m=ui.photoIdentifyModal;
+  const body=m.loading
+    ?'<div class="status-card"><div class="spinner" style="margin:0 auto 12px;"></div>Identifying item…</div>'
+    :(m.err?'<div class="error-card">'+h(m.err)+'</div>':'');
+  return (
+    '<div class="modal-overlay" id="pp-modal-overlay">'+
+      '<div class="modal-sheet">'+
+        '<button class="modal-close" data-action="close-photo-identify">×</button>'+
+        '<div class="modal-title" style="margin-bottom:14px;">📸 Photo</div>'+
+        body+
+      '</div>'+
+    '</div>'
+  );
+}
+function renderScanResultModal(){
+  const m=ui.scanResultModal;
+  const catOptions=state.settings.categories.map(c=>'<option value="'+h(c.name)+'" '+(c.name===m.category?'selected':'')+'>'+c.emoji+' '+h(c.name)+'</option>').join('');
+  const targetBtns=['kitchen','grocery'].map(t=>
+    '<button type="button" class="pill-btn '+(m.target===t?'active':'')+'" data-action="set-scan-result-target" data-val="'+t+'">'+(t==='kitchen'?'🍳 Kitchen':'🛒 Grocery list')+'</button>'
+  ).join('');
+  return (
+    '<div class="modal-overlay" id="pp-modal-overlay">'+
+      '<div class="modal-sheet">'+
+        '<button class="modal-close" data-action="close-scan-result">×</button>'+
+        '<div class="modal-title" style="margin-bottom:14px;">'+(m.emoji||'📦')+' Add item</div>'+
+        '<div class="field" style="margin-bottom:12px;"><label>Add to</label><div style="display:flex;gap:8px;">'+targetBtns+'</div></div>'+
+        '<div class="field" style="margin-bottom:12px;"><label>Name</label><input id="scan-result-name" data-live="scan-result-name" value="'+h(m.name)+'"></div>'+
+        '<div class="field" style="margin-bottom:12px;"><label>Category</label><select id="scan-result-cat" data-change="scan-result-cat">'+catOptions+'</select></div>'+
+        '<div class="form-grid" style="margin-bottom:12px;">'+
+          '<div class="field"><label>Quantity</label><input id="scan-result-qty" data-live="scan-result-qty" type="'+(m.target==='kitchen'?'number':'text')+'" value="'+h(m.quantity)+'"></div>'+
+          (m.target==='kitchen'?'<div class="field"><label>Unit</label><input id="scan-result-unit" data-live="scan-result-unit" value="'+h(m.unit)+'" placeholder="pcs, cans…"></div>':'')+
+        '</div>'+
+        (m.err?'<div style="color:var(--orange);font-size:12.5px;font-weight:700;margin-bottom:10px;">'+h(m.err)+'</div>':'')+
+        '<div class="form-actions">'+
+          '<button type="button" class="btn btn-primary" data-action="submit-scan-result">Add item</button>'+
+          '<button type="button" class="btn btn-secondary" data-action="close-scan-result">Cancel</button>'+
+        '</div>'+
+      '</div>'+
+    '</div>'
+  );
+}
+
 // ─── RENDER: GROCERY ──────────────────────────────────────────────────────
 function groceryFiltered(){
   let filtered=state.grocery.filter(g=>!g.checked);
@@ -2314,6 +2586,8 @@ function renderGrocery(){
     '<input id="grocery-quick-qty" class="g-input" placeholder="qty" style="width:70px;" data-live="grocery-quick-qty">'+
     '<input id="grocery-quick-store" class="g-input" list="store-dl" placeholder="store" style="width:110px;" data-live="grocery-quick-store">'+
     '<button class="btn btn-primary" data-action="quick-add-grocery-form" style="padding:8px 14px;">Add</button>'+
+    '<button class="btn btn-secondary" data-action="open-barcode-scan" data-target="grocery" style="padding:8px 14px;">📷 Scan</button>'+
+    '<button class="btn btn-secondary" data-action="open-photo-identify" data-target="grocery" style="padding:8px 14px;">📸 Photo</button>'+
   '</div>';
   const showCheckedLabel=ui.showChecked?'Hide checked ('+doneCount+')':'Show checked ('+doneCount+')';
   const printBtn=doneCount+groceryFiltered().length>0?'<button class="print-btn" onclick="window.print()">🖨 Print</button>':'';
@@ -4186,6 +4460,8 @@ document.addEventListener('click',e=>{
     ui.showAddItem=false;ui.editingItemId=null;
     ui.leftoverFormModal=null;ui.leftoverFormError='';
     ui.adminDeleteFamilyModal=null;
+    if(ui.barcodeScanModal) stopBarcodeCamera();
+    ui.barcodeScanModal=null;ui.photoIdentifyModal=null;ui.scanResultModal=null;
     renderModal();return;
   }
   if(e.target.id==='pp-cooking-overlay'){
@@ -4321,6 +4597,20 @@ document.addEventListener('click',e=>{
       const m=ui.leftoverEatModal;
       if(m){const item=state.inventory.find(i=>i.id===m.leftoverId);if(item) discardLeftover(item,m.date,m.slot,m.meal);}
     }break;
+    // scan & identify
+    case 'open-barcode-scan': openBarcodeScan(a.target);break;
+    case 'close-barcode-scan': closeBarcodeScan();break;
+    case 'barcode-use-manual': switchToManualBarcode();break;
+    case 'barcode-submit-manual': submitManualBarcode();break;
+    case 'barcode-not-found-continue':{
+      const target=ui.barcodeScanModal?ui.barcodeScanModal.target:'kitchen';
+      openScanResult({target});
+    }break;
+    case 'open-photo-identify': triggerPhotoIdentify(a.target);break;
+    case 'close-photo-identify': ui.photoIdentifyModal=null;renderModal();break;
+    case 'set-scan-result-target': if(ui.scanResultModal){ui.scanResultModal.target=a.val;renderModal();}break;
+    case 'submit-scan-result': submitScanResult();break;
+    case 'close-scan-result': closeScanResult();break;
     case 'plan-recipe-result':{
       const r=ui.recipes[Number(a.idx)];
       if(r){ saveRecipe(r); openAssignModalFor(r.title); }
@@ -4551,12 +4841,16 @@ document.addEventListener('input',e=>{
   else if(live==='leftover-expires-on'){
     if(ui.leftoverFormModal) ui.leftoverFormModal.expiresOn=el.value;
   }
+  else if(live==='scan-result-name'){ if(ui.scanResultModal) ui.scanResultModal.name=el.value; }
+  else if(live==='scan-result-qty'){ if(ui.scanResultModal) ui.scanResultModal.quantity=el.value; }
+  else if(live==='scan-result-unit'){ if(ui.scanResultModal) ui.scanResultModal.unit=el.value; }
 });
 
 document.addEventListener('change',e=>{
   const el=e.target;const ch=el.dataset.change;
   if(!ch) return;
-  if(ch==='g-qty'){updateGroceryField(el.dataset.id,'quantity',el.value);}
+  if(ch==='scan-result-cat'){ if(ui.scanResultModal) ui.scanResultModal.category=el.value; }
+  else if(ch==='g-qty'){updateGroceryField(el.dataset.id,'quantity',el.value);}
   else if(ch==='g-store'){updateGroceryField(el.dataset.id,'store',el.value);}
   else if(ch==='g-cat'){
     updateGroceryField(el.dataset.id,'category',el.value);
@@ -4625,6 +4919,10 @@ window.addEventListener('unhandledrejection',e=>{
   const reason=e.reason;
   reportClientError('Unhandled promise rejection: '+(reason&&reason.message?reason.message:reason),reason&&reason.stack);
 });
+
+// Persistent element (see markup comment) — attached once directly, not through
+// the delegated data-change system, since it lives outside the templated regions.
+document.getElementById('photo-file-input').addEventListener('change',handlePhotoFileChosen);
 
 // ─── INIT ─────────────────────────────────────────────────────────────────
 boot();
