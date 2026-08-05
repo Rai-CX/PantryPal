@@ -558,8 +558,14 @@ async function loadState(){
 // pull in anything we don't have yet (by title, case-insensitive), same top-up
 // pattern used for the starter SEED_RECIPES above.
 async function syncSharedRecipes(){
-  const data = await api('GET','recipes/shared');
-  if(!data||!Array.isArray(data.recipes)||!data.recipes.length) return;
+  const cursor = state.settings.sharedRecipesCursor || 0;
+  const data = await api('GET','recipes/shared?afterId='+cursor);
+  if(!data) return;
+  if(typeof data.lastId==='number'&&data.lastId!==cursor){
+    state.settings.sharedRecipesCursor = data.lastId;
+    saveSettings();
+  }
+  if(!Array.isArray(data.recipes)||!data.recipes.length) return;
   const existingTitles = new Set(state.cookbook.map(r=>r.title.toLowerCase()));
   const missing = data.recipes.filter(r=>r&&r.title&&!existingTitles.has(r.title.toLowerCase()));
   if(missing.length){
@@ -1422,26 +1428,33 @@ const ALWAYS_HAVE=['salt','pepper','water','oil','olive oil','vegetable oil','co
 // these alone (e.g. "ground" in "ground turkey" vs "Ground Beef") causes false
 // positives, so they're stripped before the word-level fallback match.
 const INGREDIENT_FILLER_WORDS=['ground','fresh','chopped','diced','sliced','minced','cooked','raw','frozen','canned','dried','shredded','grated','crushed','whole','large','small','medium','ripe','boneless','skinless','lean','extra'];
-function invFuzzyMatch(name){
+// Precomputed once per hot-path render pass (see renderCookbook/cookbookFiltered)
+// so a cookbook-wide scan doesn't re-lowercase every inventory item on every
+// ingredient of every recipe. Callers that check a single recipe can omit this —
+// it's built fresh on demand, same result either way.
+function buildInvLowerIndex(){
+  return state.inventory.filter(item=>!isLow(item)).map(item=>({item,lower:item.name.toLowerCase()}));
+}
+function invFuzzyMatch(name,invIndex){
   const n=(name||'').toLowerCase().trim();
   if(!n) return false;
   if(ALWAYS_HAVE.some(s=>n===s||n.includes(s))) return true;
   const words=n.split(/\s+/).filter(w=>w.length>3&&!INGREDIENT_FILLER_WORDS.includes(w));
-  return state.inventory.some(item=>{
-    if(isLow(item)) return false;
-    const iName=item.name.toLowerCase();
+  const idx=invIndex||buildInvLowerIndex();
+  return idx.some(({lower:iName})=>{
     if(iName.includes(n)||n.includes(iName)) return true;
     // Every remaining significant word must appear in THIS SAME item's name —
     // matching on just one shared word (e.g. both containing "ground") isn't enough.
     return words.length>0&&words.every(w=>iName.includes(w));
   });
 }
-function recipeAvailability(recipe){
+function recipeAvailability(recipe,invIndex){
   const ings=recipe.ingredients||[];
   if(!ings.length) return null;
+  const idx=invIndex||buildInvLowerIndex();
   const items=ings.map(i=>{
     const name=i.name||String(i);
-    const have=typeof i.have==='boolean'?i.have:invFuzzyMatch(name);
+    const have=typeof i.have==='boolean'?i.have:invFuzzyMatch(name,idx);
     return {name,quantity:i.quantity||'',have};
   });
   const haveCount=items.filter(i=>i.have).length;
@@ -2562,7 +2575,7 @@ function recipeIngredientMatchCount(recipe,wantedIngredients){
   const names=(recipe.ingredients||[]).map(i=>(i.name||String(i)).toLowerCase());
   return wantedIngredients.filter(w=>names.some(n=>n.includes(w.toLowerCase()))).length;
 }
-function cookbookFiltered(){
+function cookbookFiltered(invIndex){
   let books=state.cookbook.slice();
   if(ui.cbSearch){
     const q=ui.cbSearch.toLowerCase();
@@ -2571,7 +2584,10 @@ function cookbookFiltered(){
       ||(r.ingredients||[]).some(i=>(i.name||String(i)).toLowerCase().includes(q)));
   }
   if(ui.cbMealFilter!=='All') books=books.filter(r=>r.mealType===ui.cbMealFilter);
-  if(ui.cbCanMake)         books=books.filter(r=>{ const a=recipeAvailability(r); return !a||a.missing===0; });
+  if(ui.cbCanMake){
+    const idx=invIndex||buildInvLowerIndex();
+    books=books.filter(r=>{ const a=recipeAvailability(r,idx); return !a||a.missing===0; });
+  }
   if(ui.cbFav)             books=books.filter(r=>r.favorite);
   const wanted=ui.cookFilters.ingredients||[];
   if(wanted.length){
@@ -2584,20 +2600,28 @@ function cookbookFiltered(){
   }
   return books;
 }
-function renderCookbookCards(){
+function renderCookbookCards(invIndex){
   if(ui.generatingRandom) return '<div class="status-card"><div class="spinner" style="margin:0 auto 12px;"></div>Generating new recipes…</div>';
-  if(ui.generateError) return '<div class="error-card" style="margin-bottom:12px;">'+h(ui.generateError)+'</div>'+renderCookbookCardsInner();
-  return renderCookbookCardsInner();
+  if(ui.generateError) return '<div class="error-card" style="margin-bottom:12px;">'+h(ui.generateError)+'</div>'+renderCookbookCardsInner(invIndex);
+  return renderCookbookCardsInner(invIndex);
 }
-function renderCookbookCardsInner(){
-  const books=cookbookFiltered();
-  return books.length===0
-    ?'<div class="status-card">'+(state.cookbook.length===0?'No saved recipes yet. Generate some above and hit 🔖 Save, or add one manually below.':'No recipes match your filters.')+'</div>'
-    :'<div class="recipe-grid">'+books.map(r=>renderCbCard(r)).join('')+'</div>';
+function renderCookbookCardsInner(invIndex){
+  const idx=invIndex||buildInvLowerIndex();
+  const books=cookbookFiltered(idx);
+  if(books.length===0){
+    return '<div class="status-card">'+(state.cookbook.length===0?'No saved recipes yet. Generate some above and hit 🔖 Save, or add one manually below.':'No recipes match your filters.')+'</div>';
+  }
+  const limit=ui.cbShowLimit||30;
+  const shown=books.slice(0,limit);
+  const moreBtn=books.length>limit
+    ?'<div style="text-align:center;margin-top:14px;"><button class="btn btn-secondary" data-action="cookbook-show-more">Show more ('+(books.length-limit)+' left)</button></div>'
+    :'';
+  return '<div class="recipe-grid">'+shown.map(r=>renderCbCard(r,idx)).join('')+'</div>'+moreBtn;
 }
 function renderCookbook(){
+  const invIdx=buildInvLowerIndex();
   const total=state.cookbook.length;
-  const canMakeCount=state.cookbook.filter(r=>{ const a=recipeAvailability(r); return a&&a.missing===0; }).length;
+  const canMakeCount=state.cookbook.filter(r=>{ const a=recipeAvailability(r,invIdx); return a&&a.missing===0; }).length;
   const legend='<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:14px;font-size:12px;font-weight:800;">'+
     '<span><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);margin-right:4px;"></span>Ready to cook</span>'+
     '<span><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--gold);margin-right:4px;"></span>Partial match</span>'+
@@ -2632,11 +2656,11 @@ function renderCookbook(){
   '</div>'+
   '<div class="pill-filters" style="margin-bottom:16px;">'+mealFilterBtns+canMakeBtn+favBtn+'</div>'+
   (ui.showAddCookbook?renderAddCookbookForm():'')+
-  '<div id="cookbook-cards">'+renderCookbookCards()+'</div>';
+  '<div id="cookbook-cards">'+renderCookbookCards(invIdx)+'</div>';
 }
 
-function renderCbCard(r){
-  const avail=recipeAvailability(r);
+function renderCbCard(r,invIndex){
+  const avail=recipeAvailability(r,invIndex);
 
   // Availability dot color
   let dotColor='var(--border)';
@@ -4184,9 +4208,10 @@ document.addEventListener('click',e=>{
     case 'open-add-cookbook': ui.showAddCookbook=true;render();break;
     case 'close-add-cookbook': ui.showAddCookbook=false;render();break;
     case 'delete-cookbook': if(confirm('Remove this recipe?')){deleteCookbookItem(a.id);}break;
-    case 'set-cb-meal': ui.cbMealFilter=a.val;render();break;
-    case 'toggle-cb-can-make': ui.cbCanMake=!ui.cbCanMake;render();break;
-    case 'toggle-cb-fav': ui.cbFav=!ui.cbFav;render();break;
+    case 'set-cb-meal': ui.cbMealFilter=a.val;ui.cbShowLimit=30;render();break;
+    case 'toggle-cb-can-make': ui.cbCanMake=!ui.cbCanMake;ui.cbShowLimit=30;render();break;
+    case 'toggle-cb-fav': ui.cbFav=!ui.cbFav;ui.cbShowLimit=30;render();break;
+    case 'cookbook-show-more': ui.cbShowLimit=(ui.cbShowLimit||30)+30; partialUpdate('cookbook-cards', renderCookbookCards()); break;
     case 'toggle-cb-fav-item':{const r=state.cookbook.find(x=>x.id===a.id);if(r){r.favorite=!r.favorite;saveCookbook();render();}}break;
     case 'rate-recipe':{const r=state.cookbook.find(x=>x.id===a.id);if(r){r.rating=Number(a.val);saveCookbook();render();}}break;
     case 'clear-recipe-rating':{const r=state.cookbook.find(x=>x.id===a.id);if(r){delete r.rating;saveCookbook();render();}}break;
@@ -4423,6 +4448,7 @@ document.addEventListener('input',e=>{
   }
   else if(live==='cb-search'){
     ui.cbSearch=el.value;
+    ui.cbShowLimit=30;
     partialUpdate('cookbook-cards', renderCookbookCards());
   }
   else if(live==='grocery-quick-name'){

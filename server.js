@@ -832,8 +832,13 @@ app.post('/api/recipes/share', auth, async (req, res) => {
 });
 
 app.get('/api/recipes/shared', auth, async (req, res) => {
-  const { rows } = await pool.query('SELECT recipe FROM shared_recipes');
-  res.json({ recipes: rows.map(r => r.recipe) });
+  const afterId = parseInt(req.query.afterId, 10) || 0;
+  const { rows } = await pool.query(
+    'SELECT id, recipe FROM shared_recipes WHERE id > $1 ORDER BY id ASC LIMIT 500',
+    [afterId]
+  );
+  const lastId = rows.length ? rows[rows.length - 1].id : afterId;
+  res.json({ recipes: rows.map(r => r.recipe), lastId });
 });
 
 // No auth required — a crash can happen before login too. If a valid token IS
