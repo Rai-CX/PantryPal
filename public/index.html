@@ -932,10 +932,48 @@ async function lookupBarcode(code){
       openScanResult({name,category:getCat(guessCategory(name)).name,quantity:1,unit:'',target,emoji:guessItemEmoji(name)});
       return;
     }
-  }catch(e){/* fall through to not-found */}
+  }catch(e){/* fall through to the web-search fallback below */}
+  // Not in the free public database (common for smaller/regional brands) —
+  // try one AI web search before giving up, same Claude proxy the other AI
+  // features already use, just with the web_search server tool attached.
   if(ui.barcodeScanModal){
-    ui.barcodeScanModal.status='not-found';
+    ui.barcodeScanModal.status='searching-web';
     renderModal();
+  }
+  await lookupBarcodeViaWebSearch(code,target);
+}
+async function lookupBarcodeViaWebSearch(code,target){
+  const catNames=state.settings.categories.map(c=>c.name).join(', ');
+  const system='You are a barcode-lookup assistant inside a home kitchen/pantry app called PantryPal. '+
+    'A user scanned a barcode that was not found in the public Open Food Facts database. '+
+    'Use web search to try to identify the specific product this barcode belongs to (retailer listings, '+
+    'barcode lookup sites, manufacturer pages, etc). Respond ONLY with a raw JSON object (no markdown, no '+
+    'commentary): {"name":string,"category":string,"quantity":number,"unit":string}. "category" must be '+
+    'exactly one of: '+catNames+'. "unit" should be a short common unit like "pcs","cans","g","lb","oz". '+
+    'Default quantity to 1 and unit to "pcs" unless packaging clearly states otherwise. If you cannot '+
+    'confidently identify the exact product from search results, respond with {"name":"","category":"","quantity":1,"unit":""}.';
+  try{
+    const data=await api('POST','generate-recipe',{
+      max_tokens:1024,system,
+      messages:[{role:'user',content:'Barcode: '+code}],
+      tools:[{type:'web_search_20260209',name:'web_search',max_uses:2}]
+    });
+    if(!data) throw new Error('request failed');
+    // Search runs interleave server_tool_use/web_search_tool_result blocks with
+    // text — the model's actual answer is the LAST text block, not the first
+    // (which may just be "let me look that up" commentary before searching).
+    const textBlocks=(data.content||[]).filter(b=>b.type==='text');
+    let text=(textBlocks.length?textBlocks[textBlocks.length-1].text:'')||'';
+    text=text.trim().replace(/^```json/i,'').replace(/^```/,'').replace(/```$/,'').trim();
+    const result=JSON.parse(text);
+    if(!result.name) throw new Error('not identified');
+    const category=state.settings.categories.some(c=>c.name===result.category)?result.category:getCat(guessCategory(result.name)).name;
+    openScanResult({name:result.name,category,quantity:Number(result.quantity)||1,unit:result.unit||'',target,emoji:guessItemEmoji(result.name)});
+  }catch(e){
+    if(ui.barcodeScanModal){
+      ui.barcodeScanModal.status='not-found';
+      renderModal();
+    }
   }
 }
 
@@ -2553,6 +2591,8 @@ function renderBarcodeScanModal(){
       '<button type="button" class="btn-ghost" data-action="barcode-use-manual" style="display:block;margin:0 auto;">Enter the number instead</button>';
   } else if(m.status==='looking-up'){
     body='<div class="status-card"><div class="spinner" style="margin:0 auto 12px;"></div>Looking that up…</div>';
+  } else if(m.status==='searching-web'){
+    body='<div class="status-card"><div class="spinner" style="margin:0 auto 12px;"></div>Not in the product database — searching the web…</div>';
   } else if(m.status==='not-found'){
     body='<div class="error-card" style="margin-bottom:12px;">Couldn\'t find that product in the barcode database — this happens for smaller/regional brands. You can still add it manually, or try a photo instead.</div>'+
       '<div style="display:flex;flex-direction:column;gap:8px;">'+

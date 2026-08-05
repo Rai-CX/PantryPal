@@ -1073,15 +1073,17 @@ app.post('/api/generate-recipe', auth, async (req, res) => {
   if (!ANTHROPIC_API_KEY) {
     return res.status(500).json({ error: 'ANTHROPIC_API_KEY is not configured' });
   }
-  const { system, messages, max_tokens } = req.body || {};
+  const { system, messages, max_tokens, tools } = req.body || {};
   if (!Array.isArray(messages)) {
     return res.status(400).json({ error: 'messages array is required' });
   }
 
   // Flat 1-credit pricing didn't track actual output size — a 6-recipe bulk
   // generation costs several times what a single side-suggestion does. Charge
-  // by the max_tokens the caller requested as a proxy for call size.
-  const cost = Number(max_tokens) > 2500 ? 2 : 1;
+  // by the max_tokens the caller requested as a proxy for call size. Server
+  // tools like web search carry their own per-use cost on top of tokens, so
+  // any request bringing tools is charged the higher tier regardless of size.
+  const cost = (tools || Number(max_tokens) > 2500) ? 2 : 1;
   const { rows: spend } = await pool.query(
     'UPDATE families SET credits = credits - $2 WHERE id = $1 AND (credits IS NULL OR credits >= $2) RETURNING credits',
     [req.user.familyId, cost]
@@ -1101,6 +1103,7 @@ app.post('/api/generate-recipe', auth, async (req, res) => {
         max_tokens: max_tokens || 1000,
         system,
         messages,
+        ...(tools ? { tools } : {}),
       }),
     });
     const data = await response.json();
