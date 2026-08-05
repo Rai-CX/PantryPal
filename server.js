@@ -492,6 +492,30 @@ app.post('/api/account/change-email', auth, async (req, res) => {
   res.json({ ok: true });
 });
 
+// Cascade-deletes an entire household's data — invites, password_resets, and
+// users are removed outright; admin_audit_log/credit_purchases/shared_recipes rows
+// are only detached (family_id set NULL) so those global/historical records survive
+// the household that originated them. Caller must wrap this in BEGIN/COMMIT.
+async function deleteFamilyCascade(client, familyId) {
+  // Invites reference users by id regardless of the invite's own family_id (e.g. the
+  // new-family invite that created this household has family_id=NULL but points at
+  // one of these users via redeemed_by_user_id) — null those refs out before the
+  // family-scoped invite delete and the user delete, or the FK constraint blocks both.
+  await client.query('UPDATE invites SET created_by_user_id = NULL WHERE created_by_user_id IN (SELECT id FROM users WHERE family_id = $1)', [familyId]);
+  await client.query('UPDATE invites SET redeemed_by_user_id = NULL WHERE redeemed_by_user_id IN (SELECT id FROM users WHERE family_id = $1)', [familyId]);
+  await client.query('DELETE FROM password_resets WHERE user_id IN (SELECT id FROM users WHERE family_id = $1)', [familyId]);
+  await client.query('DELETE FROM invites WHERE family_id = $1', [familyId]);
+  await client.query('DELETE FROM support_messages WHERE family_id = $1', [familyId]);
+  await client.query('DELETE FROM api_usage WHERE family_id = $1', [familyId]);
+  await client.query('DELETE FROM client_errors WHERE family_id = $1', [familyId]);
+  await client.query('UPDATE admin_audit_log SET family_id = NULL WHERE family_id = $1', [familyId]);
+  await client.query('UPDATE credit_purchases SET family_id = NULL WHERE family_id = $1', [familyId]);
+  await client.query('UPDATE shared_recipes SET origin_family_id = NULL WHERE origin_family_id = $1', [familyId]);
+  await client.query('DELETE FROM app_state WHERE family_id = $1', [familyId]);
+  await client.query('DELETE FROM users WHERE family_id = $1', [familyId]);
+  await client.query('DELETE FROM families WHERE id = $1', [familyId]);
+}
+
 // Deletes the caller's own account. If they're the last member of their family,
 // the entire household (all its data) is cascade-deleted too — irreversible, so it
 // requires a password re-check. The primary owner family can't be cascade-deleted
@@ -522,23 +546,7 @@ app.delete('/api/account', auth, async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    // Invites reference users by id regardless of the invite's own family_id (e.g. the
-    // new-family invite that created this household has family_id=NULL but points at
-    // one of these users via redeemed_by_user_id) — null those refs out before the
-    // family-scoped invite delete and the user delete, or the FK constraint blocks both.
-    await client.query('UPDATE invites SET created_by_user_id = NULL WHERE created_by_user_id IN (SELECT id FROM users WHERE family_id = $1)', [req.user.familyId]);
-    await client.query('UPDATE invites SET redeemed_by_user_id = NULL WHERE redeemed_by_user_id IN (SELECT id FROM users WHERE family_id = $1)', [req.user.familyId]);
-    await client.query('DELETE FROM password_resets WHERE user_id IN (SELECT id FROM users WHERE family_id = $1)', [req.user.familyId]);
-    await client.query('DELETE FROM invites WHERE family_id = $1', [req.user.familyId]);
-    await client.query('DELETE FROM support_messages WHERE family_id = $1', [req.user.familyId]);
-    await client.query('DELETE FROM api_usage WHERE family_id = $1', [req.user.familyId]);
-    await client.query('DELETE FROM client_errors WHERE family_id = $1', [req.user.familyId]);
-    await client.query('UPDATE admin_audit_log SET family_id = NULL WHERE family_id = $1', [req.user.familyId]);
-    await client.query('UPDATE credit_purchases SET family_id = NULL WHERE family_id = $1', [req.user.familyId]);
-    await client.query('UPDATE shared_recipes SET origin_family_id = NULL WHERE origin_family_id = $1', [req.user.familyId]);
-    await client.query('DELETE FROM app_state WHERE family_id = $1', [req.user.familyId]);
-    await client.query('DELETE FROM users WHERE family_id = $1', [req.user.familyId]);
-    await client.query('DELETE FROM families WHERE id = $1', [req.user.familyId]);
+    await deleteFamilyCascade(client, req.user.familyId);
     await client.query('COMMIT');
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
@@ -785,6 +793,42 @@ app.get('/api/admin/families/:id/data', auth, async (req, res) => {
 
   await logAudit(req.user.familyId, req.user.userId, 'view_family_data', fam[0].name);
   res.json({ family: fam[0], members, state });
+});
+
+// Owner-only: permanently deletes another household (e.g. a stale/test/orphaned
+// one spotted in the admin list). Requires the ADMIN's own password re-check —
+// same re-auth pattern as the self-service account deletion above — and can never
+// target the primary owner-operator household.
+app.delete('/api/admin/families/:id', auth, async (req, res) => {
+  if (!req.user.isOwnerFamily) return res.status(403).json({ error: 'Owner access only' });
+  const { rows: caller } = await pool.query('SELECT role, password_hash FROM users WHERE id = $1', [req.user.userId]);
+  if (!caller[0] || caller[0].role !== 'owner') return res.status(403).json({ error: 'Owner access only' });
+  const { password } = req.body || {};
+  if (!password) return res.status(400).json({ error: 'Password is required' });
+  if (!(await bcrypt.compare(password, caller[0].password_hash))) {
+    return res.status(401).json({ error: 'Password is incorrect' });
+  }
+  const targetId = Number(req.params.id);
+  if (!targetId) return res.status(400).json({ error: 'Invalid household id' });
+  const { rows: fam } = await pool.query('SELECT id, name, is_owner_family FROM families WHERE id = $1', [targetId]);
+  if (!fam.length) return res.status(404).json({ error: 'Household not found' });
+  if (fam[0].is_owner_family) {
+    return res.status(403).json({ error: 'Can\'t delete the primary/operator household.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await deleteFamilyCascade(client, targetId);
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
+  await logAudit(req.user.familyId, req.user.userId, 'admin_delete_family', fam[0].name);
+  res.json({ ok: true });
 });
 
 app.get('/api/family/audit-log', auth, async (req, res) => {

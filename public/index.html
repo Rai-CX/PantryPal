@@ -666,6 +666,7 @@ let ui={
   myUserId:null, myRole:'member', myEmail:'',
   adminFamilies:[], adminLoaded:false, newInviteCode:'', newInviteExpires:'', newInviteLoading:false,
   householdDetailModal:null, householdDetailLoading:false, // {family, members, state}
+  adminDeleteFamilyModal:null, // {id, name, password, confirmText, loading, err}
   accountMsg:'', accountErr:'', emailMsg:'', emailErr:'',
   billingHistory:[], billingLoaded:false,
   collapsedGroups:new Set(),
@@ -1807,6 +1808,7 @@ function renderModal(){
   else if(ui.leftoverFormModal){ root.innerHTML=renderLeftoverFormModal(); }
   else if(ui.showAddItem){ root.innerHTML=renderItemFormModal(); }
   else if(ui.householdDetailModal){ root.innerHTML=renderHouseholdDetailModal(); }
+  else if(ui.adminDeleteFamilyModal){ root.innerHTML=renderAdminDeleteFamilyModal(); }
   else { root.innerHTML=''; return; }
   setTimeout(()=>{const el=document.getElementById('planner-search-input')||document.querySelector('#modal-root input[name="name"]');if(el)el.focus();},0);
 }
@@ -3739,13 +3741,42 @@ function formatLastSeen(dateStr){
   if(days<30) return days+'d ago';
   return new Date(dateStr).toLocaleDateString();
 }
+function renderAdminDeleteFamilyModal(){
+  const m=ui.adminDeleteFamilyModal;
+  return (
+    '<div class="modal-overlay" id="pp-modal-overlay">'+
+      '<div class="modal-sheet">'+
+        '<button class="modal-close" data-action="close-admin-delete-family">×</button>'+
+        '<div class="modal-title" style="margin-bottom:4px;color:var(--orange);">🗑 Delete household</div>'+
+        '<div style="font-size:13px;color:var(--ink-soft);font-weight:700;margin-bottom:14px;">'+h(m.name)+'</div>'+
+        '<p style="font-size:12.5px;color:var(--orange);font-weight:700;margin-bottom:12px;">'+
+          'This permanently deletes this household\'s account, kitchen, cookbook, grocery list, and planner. This can\'t be undone.'+
+        '</p>'+
+        '<form data-form="admin-delete-family">'+
+          '<div class="field" style="margin-bottom:10px;"><label>Your password</label><input type="password" id="admin-del-fam-pw" autocomplete="current-password" required></div>'+
+          '<div class="field" style="margin-bottom:10px;"><label>Type the household name ('+h(m.name)+') to confirm</label><input id="admin-del-fam-confirm" required></div>'+
+          (m.err?'<p style="color:var(--orange);font-size:12.5px;font-weight:700;margin-bottom:10px;">'+h(m.err)+'</p>':'')+
+          '<div class="form-actions">'+
+            '<button type="submit" class="btn btn-primary" style="background:var(--orange);border-color:var(--orange);" '+(m.loading?'disabled':'')+'>'+(m.loading?'Deleting…':'Delete household')+'</button>'+
+            '<button type="button" class="btn btn-secondary" data-action="close-admin-delete-family">Cancel</button>'+
+          '</div>'+
+        '</form>'+
+      '</div>'+
+    '</div>'
+  );
+}
 function renderAdminHouseholds(){
   const rows = ui.adminFamilies.map(f=>
     '<div class="settings-row" style="flex-direction:column;align-items:stretch;">'+
       '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">'+
         '<span style="font-weight:700;">'+h(f.name)+(f.is_owner_family?' (you)':'')+'</span>'+
         '<span style="color:var(--ink-soft);font-size:12px;">'+(f.credits===null?'Unlimited':f.credits+' credits')+' · '+f.member_count+' member'+(f.member_count===1?'':'s')+' · joined '+h(new Date(f.created_at).toLocaleDateString())+'</span>'+
-        (!f.is_owner_family?'<button class="btn-ghost" data-action="view-family-data" data-id="'+f.id+'" data-name="'+h(f.name)+'" style="margin-left:auto;">👁 View data</button>':'')+
+        (!f.is_owner_family?
+          '<span style="margin-left:auto;display:flex;gap:8px;">'+
+            '<button class="btn-ghost" data-action="view-family-data" data-id="'+f.id+'" data-name="'+h(f.name)+'">👁 View data</button>'+
+            '<button class="btn-ghost" data-action="open-admin-delete-family" data-id="'+f.id+'" data-name="'+h(f.name)+'" style="color:var(--orange);">🗑 Delete</button>'+
+          '</span>'
+        :'')+
       '</div>'+
       (!f.is_owner_family?
         '<div style="display:flex;gap:14px;flex-wrap:wrap;font-size:11.5px;color:var(--ink-soft);font-weight:700;margin-top:6px;">'+
@@ -4013,6 +4044,25 @@ async function deleteAccount(){
   render();
 }
 
+async function deleteFamilyAdmin(){
+  const m=ui.adminDeleteFamilyModal;if(!m)return;
+  const password=document.getElementById('admin-del-fam-pw').value;
+  const confirmText=document.getElementById('admin-del-fam-confirm').value;
+  m.err='';
+  if(confirmText!==m.name){ m.err='Type the household name exactly to confirm.'; renderModal(); return; }
+  if(!confirm('This is permanent and cannot be undone. Delete "'+m.name+'"?')) return;
+  m.loading=true;renderModal();
+  const data=await api('DELETE','admin/families/'+m.id,{password});
+  if(data&&data.ok){
+    ui.adminDeleteFamilyModal=null;
+    loadAdminFamilies();
+    return;
+  }
+  m.loading=false;
+  m.err=lastApiStatus===401?'Password is incorrect.':lastApiStatus===403?(data&&data.error||'This household can\'t be deleted.'):lastApiStatus===404?'Household not found — it may have already been deleted.':'Couldn\'t delete household — try again.';
+  renderModal();
+}
+
 async function saveProfile(){
   const firstName=document.getElementById('profile-first-name').value;
   const lastName=document.getElementById('profile-last-name').value;
@@ -4135,6 +4185,7 @@ document.addEventListener('click',e=>{
     ui.recipeViewModal=null;ui.assignModal=null;
     ui.showAddItem=false;ui.editingItemId=null;
     ui.leftoverFormModal=null;ui.leftoverFormError='';
+    ui.adminDeleteFamilyModal=null;
     renderModal();return;
   }
   if(e.target.id==='pp-cooking-overlay'){
@@ -4223,6 +4274,10 @@ document.addEventListener('click',e=>{
     }break;
     case 'close-recipe-view': ui.recipeViewModal=null; renderModal(); break;
     case 'view-family-data': viewFamilyData(Number(a.id),a.name); break;
+    case 'open-admin-delete-family':
+      ui.adminDeleteFamilyModal={id:Number(a.id),name:a.name,loading:false,err:''};
+      renderModal();break;
+    case 'close-admin-delete-family': ui.adminDeleteFamilyModal=null; renderModal(); break;
     case 'close-household-detail': ui.householdDetailModal=null; renderModal(); break;
     case 'toggle-recipe-view-size': if(ui.recipeViewModal){ ui.recipeViewModal.large=!ui.recipeViewModal.large; renderModal(); } break;
     // assign-to-planner modal (used from the cookbook and the planner's recipe browser)
@@ -4551,6 +4606,7 @@ document.addEventListener('submit',e=>{
   else if(form.dataset.form==='change-password'){changePassword();}
   else if(form.dataset.form==='change-email'){changeEmail();}
   else if(form.dataset.form==='delete-account'){deleteAccount();}
+  else if(form.dataset.form==='admin-delete-family'){deleteFamilyAdmin();}
 });
 
 // ─── ERROR REPORTING ──────────────────────────────────────────────────────
