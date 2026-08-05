@@ -645,7 +645,7 @@ let ui={
   plannerSearch:'', plannerShowCreate:false, plannerMealFilter:'All', plannerShowLimit:40,
   plannerGenerating:false, plannerGenerateError:'',
   // recipe browser (within planner tab)
-  browserSearch:'', browserMealFilter:'All',
+  browserSearch:'', browserMealFilter:'All', browserShowLimit:30,
   browserShowAddForm:false, generatingRandom:false, generateError:'',
   suggestedSides:{}, suggestingSideFor:null, sideError:'',
   // settings
@@ -3546,7 +3546,12 @@ function renderRecipeBrowserListInner(){
   if(ui.browserSearch) recipes=recipes.filter(r=>r.title.toLowerCase().includes(ui.browserSearch.toLowerCase())||(r.cuisine&&r.cuisine.toLowerCase().includes(ui.browserSearch.toLowerCase())));
   if(ui.browserMealFilter!=='All') recipes=recipes.filter(r=>r.mealType===ui.browserMealFilter);
   if(!recipes.length) return '<div class="status-card" style="padding:24px;">No recipes found.</div>';
-  return '<div class="browser-grid">'+recipes.map(r=>{
+  const limit=ui.browserShowLimit||30;
+  const shown=recipes.slice(0,limit);
+  const moreBtn=recipes.length>limit
+    ?'<div style="text-align:center;margin-top:14px;"><button class="btn btn-secondary" data-action="browser-show-more">Show more ('+(recipes.length-limit)+' left)</button></div>'
+    :'';
+  return '<div class="browser-grid">'+shown.map(r=>{
     const meta=[r.mealType,r.totalTimeMinutes?r.totalTimeMinutes+'min':null].filter(Boolean).join(' · ');
     return '<div class="browser-card-wrap">'+
       '<div class="browser-card">'+
@@ -3558,7 +3563,7 @@ function renderRecipeBrowserListInner(){
         '<button type="button" class="browser-plan-btn" data-action="open-assign-modal" data-title="'+h(r.title)+'">+ Plan</button>'+
       '</div>'+
     '</div>';
-  }).join('')+'</div>';
+  }).join('')+'</div>'+moreBtn;
 }
 
 function renderPlanner(){
@@ -3857,7 +3862,7 @@ function renderHouseholdBilling(){
         '<p style="color:var(--ink-soft);font-size:13px;margin-bottom:10px;">'+h(creditsRow)+'</p>'+
         (ui.credits!==null&&ui.credits<=5?'<p style="color:var(--orange);font-size:12.5px;font-weight:800;margin:-4px 0 10px;">⚡ Running low — top up so recipe generation keeps working.</p>':'')+
         packBtns+
-        (ui.checkoutMessage?'<p style="color:'+(ui.checkoutMessage.startsWith('Checkout canceled')?'var(--ink-soft)':'var(--green)')+';font-size:13px;font-weight:700;margin-top:10px;">'+h(ui.checkoutMessage)+'</p>':'')+
+        (ui.checkoutMessage?'<p style="color:'+(ui.checkoutMessage.startsWith('Error:')?'var(--orange)':ui.checkoutMessage.startsWith('Checkout canceled')?'var(--ink-soft)':'var(--green)')+';font-size:13px;font-weight:700;margin-top:10px;">'+h(ui.checkoutMessage)+'</p>':'')+
         (history?'<div style="margin-top:16px;"><label>Purchase history</label>'+history+'</div>':'')+
       '</div>'+
     '</div>';
@@ -4373,10 +4378,12 @@ async function revokeInvite(code){
 }
 
 async function buyCredits(pack){
-  ui.checkoutLoading=true;render();
+  ui.checkoutLoading=true;ui.checkoutMessage='';render();
   const data=await api('POST','checkout',{pack:pack||'small'});
   if(data && data.url){ window.location.href=data.url; return; }
-  ui.checkoutLoading=false;render();
+  ui.checkoutLoading=false;
+  ui.checkoutMessage='Error: Couldn\'t start checkout — try again in a moment, or contact support if this keeps happening.';
+  render();
 }
 
 async function loadBillingHistory(){
@@ -4836,6 +4843,11 @@ document.addEventListener('click',e=>{
       render();break;
     case 'set-browser-meal':
       ui.browserMealFilter=a.val;
+      ui.browserShowLimit=30;
+      partialUpdate('recipe-browser-list',renderRecipeBrowserList());
+      break;
+    case 'browser-show-more':
+      ui.browserShowLimit=(ui.browserShowLimit||30)+30;
       partialUpdate('recipe-browser-list',renderRecipeBrowserList());
       break;
     // settings
@@ -4956,6 +4968,7 @@ document.addEventListener('input',e=>{
   }
   else if(live==='browser-search'){
     ui.browserSearch=el.value;
+    ui.browserShowLimit=30;
     partialUpdate('recipe-browser-list', renderRecipeBrowserList());
   }
   else if(live==='leftover-expires-on'){
