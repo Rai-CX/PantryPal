@@ -2312,9 +2312,6 @@ function renderLeftoversShelf(){
   '</div>';
 }
 function renderKitchen(){
-  const addBtn='<button class="btn btn-primary" data-action="open-add-item">+ Add item</button>'+
-    '<button class="btn btn-secondary" data-action="open-barcode-scan" data-target="kitchen">📷 Scan</button>'+
-    '<button class="btn btn-secondary" data-action="open-photo-identify" data-target="kitchen">📸 Photo</button>';
   const isAllActive = ui.kitchenLoc==='All' && ui.kitchenExpiry==='all';
   const allBtn='<button class="pill-btn '+(isAllActive?'active':'')+'" data-action="reset-kitchen-filters">All</button>';
   const locBtns=LOCATIONS.map(l=>
@@ -2326,7 +2323,11 @@ function renderKitchen(){
     '<div class="search-box"><span class="search-icon">🔍</span>'+
       '<input id="kitchen-search" data-live="kitchen-search" value="'+h(ui.kitchenSearch)+'" placeholder="Search kitchen…">'+
     '</div>'+
-    addBtn+
+  '</div>'+
+  '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">'+
+    '<button class="btn btn-primary" data-action="open-add-item">+ Add item</button>'+
+    '<button class="btn btn-secondary" data-action="open-barcode-scan" data-target="kitchen">📷 Scan</button>'+
+    '<button class="btn btn-secondary" data-action="open-photo-identify" data-target="kitchen">📸 Photo</button>'+
   '</div>'+
   '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px;">'+
     '<div class="pill-filters">'+allBtn+locBtns+expiryBtns+'</div>'+
@@ -2586,8 +2587,10 @@ function renderGrocery(){
     '<input id="grocery-quick-qty" class="g-input" placeholder="qty" style="width:70px;" data-live="grocery-quick-qty">'+
     '<input id="grocery-quick-store" class="g-input" list="store-dl" placeholder="store" style="width:110px;" data-live="grocery-quick-store">'+
     '<button class="btn btn-primary" data-action="quick-add-grocery-form" style="padding:8px 14px;">Add</button>'+
-    '<button class="btn btn-secondary" data-action="open-barcode-scan" data-target="grocery" style="padding:8px 14px;">📷 Scan</button>'+
-    '<button class="btn btn-secondary" data-action="open-photo-identify" data-target="grocery" style="padding:8px 14px;">📸 Photo</button>'+
+  '</div>'+
+  '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;">'+
+    '<button class="btn btn-secondary" data-action="open-barcode-scan" data-target="grocery">📷 Scan</button>'+
+    '<button class="btn btn-secondary" data-action="open-photo-identify" data-target="grocery">📸 Photo</button>'+
   '</div>';
   const showCheckedLabel=ui.showChecked?'Hide checked ('+doneCount+')':'Show checked ('+doneCount+')';
   const printBtn=doneCount+groceryFiltered().length>0?'<button class="print-btn" onclick="window.print()">🖨 Print</button>':'';
