@@ -369,6 +369,8 @@ const COUNT_UNITS = ['pcs','cans','jars','boxes','bags','bunches','cloves'];
 const UNIT_LIST = [...COUNT_UNITS.slice(0,1),...WEIGHT_UNITS,...COUNT_UNITS.slice(1)];
 const TIME_OPTIONS = [{v:'any',l:'Any time'},{v:'15',l:'≤15 min'},{v:'30',l:'≤30 min'},{v:'45',l:'≤45 min'},{v:'60',l:'≤1 hour'},{v:'90',l:'≤90 min'}];
 const DURATION_PRESETS = [{label:'1 week',days:7},{label:'1 month',months:1},{label:'3 months',months:3},{label:'6 months',months:6},{label:'12 months',months:12}];
+const LEFTOVER_DURATION_PRESETS = [{label:'2 days',days:2},{label:'3 days',days:3},{label:'4 days',days:4},{label:'5 days',days:5},{label:'1 week',days:7}];
+const LEFTOVER_LOCATIONS = ['Fridge','Freezer'];
 
 const DEFAULT_CATEGORIES = [
   {id:'produce',name:'Produce',emoji:'🥦',color:'#4F7042',bg:'#DCE8CE',trackBy:'count',noExpiry:false},
@@ -662,7 +664,9 @@ let ui={
   billingHistory:[], billingLoaded:false,
   collapsedGroups:new Set(),
   recipeViewModal:null, // {recipe, large}
-  assignModal:null // {title, weekOffset}
+  assignModal:null, // {title, displayTitle, weekOffset}
+  leftoverFormModal:null, // {title, servings, location, expiresOn}
+  leftoverEatModal:null // {date, slot, meal, leftoverId}
 };
 
 // ─── UTILS ────────────────────────────────────────────────────────────────
@@ -703,6 +707,9 @@ function addDurationToToday(preset){
   if(preset.months) d.setMonth(d.getMonth()+preset.months);
   return dateKey(d);
 }
+const LEFTOVER_TAG_RE=/^🍱 (.+) \(leftover:([^)]+)\)$/;
+function leftoverMealInfo(meal){const m=LEFTOVER_TAG_RE.exec(meal||'');return m?{title:m[1],leftoverId:m[2]}:null;}
+function mealDisplayLabel(meal){const info=leftoverMealInfo(meal);return info?('🍱 '+info.title+' (leftover)'):meal;}
 function catTrackBy(catName){const c=getCat(catName);return c&&c.trackBy==='weight'?'weight':'count';}
 function catNoExpiry(catName){const c=getCat(catName);return !!(c&&c.noExpiry);}
 function getWeekStart(offset){
@@ -830,9 +837,15 @@ function findSideFor(mainTitle){
   const side=state.cookbook.find(r=>r.sideFor&&r.sideFor.toLowerCase()===mainTitle.toLowerCase());
   return side?side.title:null;
 }
-function openAssignModalFor(title){
+function openAssignModalFor(title,displayTitle){
   ui.recipeViewModal=null;
-  ui.assignModal={title,sideTitle:findSideFor(title),includeSide:true,weekOffset:0};
+  ui.assignModal={title,displayTitle:displayTitle||title,sideTitle:findSideFor(title),includeSide:true,weekOffset:0};
+  renderModal();
+}
+function openAssignModalForLeftover(item){
+  ui.recipeViewModal=null;
+  const title='🍱 '+item.sourceRecipeTitle+' (leftover:'+item.id+')';
+  ui.assignModal={title,displayTitle:'🍱 '+item.sourceRecipeTitle+' (leftover)',sideTitle:null,includeSide:false,weekOffset:0};
   renderModal();
 }
 // Finds another recipe planned in the same slot that's paired with `meal` — either
@@ -945,6 +958,39 @@ function removePlannerMeal(dateStr,slot,title){
   const day=getPlannerDay(dateStr),key=slot.toLowerCase();
   day[key]=slotMeals(day,slot).filter(t=>t!==title);
   savePlanner();render();
+}
+// ─── ACTIONS: LEFTOVERS ───────────────────────────────────────────────────
+function saveLeftover(){
+  const f=ui.leftoverFormModal;if(!f)return;
+  const servings=Math.max(1,parseInt(f.servings)||1);
+  if(!f.expiresOn){ui.leftoverFormError='Pick how many days until it goes bad';render();return;}
+  const item={
+    id:uid(),name:f.title,category:'Leftovers',location:f.location||'Fridge',
+    quantity:servings,unit:'servings',threshold:0,
+    expiresOn:f.expiresOn,expiryMode:'date',emoji:'🍱',
+    isLeftover:true,sourceRecipeTitle:f.title
+  };
+  state.inventory.push(item);
+  saveInv();
+  ui.leftoverFormModal=null;ui.leftoverFormError='';
+  openAssignModalForLeftover(item);
+  render();
+}
+function eatLeftover(item,date,slot,meal){
+  const cur=state.inventory.find(i=>i.id===item.id);
+  if(cur){
+    cur.quantity=Math.max(0,(Number(cur.quantity)||0)-1);
+    if(cur.quantity<=0) state.inventory=state.inventory.filter(i=>i.id!==item.id);
+    saveInv();
+  }
+  ui.leftoverEatModal=null;
+  removePlannerMeal(date,slot,meal);
+}
+function discardLeftover(item,date,slot,meal){
+  state.inventory=state.inventory.filter(i=>i.id!==item.id);
+  saveInv();
+  ui.leftoverEatModal=null;
+  removePlannerMeal(date,slot,meal);
 }
 function addWeekMissingToGrocery(){
   const ws=getWeekStart(ui.plannerWeekOffset);
@@ -1745,6 +1791,7 @@ function renderModal(){
   if(ui.plannerModal){ root.innerHTML=renderChooseRecipeModal(); }
   else if(ui.recipeViewModal){ root.innerHTML=renderRecipeViewModal(); }
   else if(ui.assignModal){ root.innerHTML=renderAssignModal(); }
+  else if(ui.leftoverFormModal){ root.innerHTML=renderLeftoverFormModal(); }
   else if(ui.showAddItem){ root.innerHTML=renderItemFormModal(); }
   else if(ui.householdDetailModal){ root.innerHTML=renderHouseholdDetailModal(); }
   else { root.innerHTML=''; return; }
@@ -1859,7 +1906,7 @@ function renderRecipeViewModal(){
 }
 
 function renderAssignModal(){
-  const{title,sideTitle,includeSide,weekOffset}=ui.assignModal;
+  const{title,displayTitle,sideTitle,includeSide,weekOffset}=ui.assignModal;
   const ws=getWeekStart(weekOffset||0);
   const we=new Date(ws);we.setDate(we.getDate()+6);
   const label=ws.toLocaleDateString(undefined,{month:'short',day:'numeric'})+' – '+we.toLocaleDateString(undefined,{month:'short',day:'numeric',year:'numeric'});
@@ -1899,7 +1946,7 @@ function renderAssignModal(){
         '<div style="padding:20px 22px 0;flex-shrink:0;">'+
           '<button class="modal-close" data-action="close-assign-modal">×</button>'+
           '<div class="modal-title" style="margin-bottom:2px;">Add to planner</div>'+
-          '<div style="font-size:13px;color:var(--ink-soft);font-weight:700;margin-bottom:'+(sideTitle?'4px':'14px')+';">'+h(title)+'</div>'+
+          '<div style="font-size:13px;color:var(--ink-soft);font-weight:700;margin-bottom:'+(sideTitle?'4px':'14px')+';">'+h(displayTitle||title)+'</div>'+
           (sideTitle?
             '<label style="display:flex;align-items:center;gap:7px;font-size:12.5px;font-weight:700;color:var(--ink-soft);margin-bottom:14px;cursor:pointer;">'+
               '<input type="checkbox" data-action="assign-modal-toggle-side" '+(includeSide?'checked':'')+' style="width:auto;margin:0;">'+
@@ -1956,7 +2003,7 @@ function renderTabs(){
 
 function renderAlertStrip(){
   const expiring=state.inventory.filter(isExpiring);
-  const low=state.inventory.filter(i=>isLow(i)&&!isExpiring(i));
+  const low=state.inventory.filter(i=>isLow(i)&&!isExpiring(i)&&!i.isLeftover);
   if(expiring.length===0&&low.length===0) return '';
   const hasAny=expiring.length+low.length>0;
   let parts=[];
@@ -2020,6 +2067,35 @@ function renderKitchenShelves(){
     '</div>';
   }).join('');
 }
+function renderLeftoversShelf(){
+  const items=state.inventory.filter(i=>i.isLeftover).sort((a,b)=>(a.expiresOn||'').localeCompare(b.expiresOn||''));
+  if(!items.length) return '';
+  const rows=items.map(item=>{
+    const exp=item.expiresOn?expiryLabel(item.expiresOn):'';
+    const warn=isExpiring(item);
+    return '<div class="item-row" style="border-left-color:#C2941F;">'+
+      '<span class="item-emoji">🍱</span>'+
+      '<div class="item-main">'+
+        '<span class="item-name">'+h(item.sourceRecipeTitle)+(warn?'<span class="low-badge">USE SOON</span>':'')+'</span>'+
+        '<div class="item-meta">'+h(item.location)+(exp?' · '+exp:'')+'</div>'+
+      '</div>'+
+      '<div class="qty-row">'+
+        '<button class="qty-btn" data-action="adj-qty" data-id="'+item.id+'" data-delta="-1">−</button>'+
+        '<span class="qty-val">'+item.quantity+' srv</span>'+
+        '<button class="qty-btn" data-action="adj-qty" data-id="'+item.id+'" data-delta="1">+</button>'+
+      '</div>'+
+      '<button class="btn-icon" data-action="open-assign-modal-for-leftover" data-id="'+item.id+'">📅 Plan to eat</button>'+
+      '<button class="btn-icon" data-action="delete-item" data-id="'+item.id+'">🗑 Toss</button>'+
+    '</div>';
+  }).join('');
+  return '<div class="shelf" style="margin-bottom:16px;">'+
+    '<div class="shelf-header">'+
+      '<span class="shelf-tag" style="background:#FCEFC7;color:#C2941F;">🍱 Leftovers</span>'+
+      '<span class="shelf-count">'+items.length+'</span>'+
+    '</div>'+
+    rows+
+  '</div>';
+}
 function renderKitchen(){
   const addBtn='<button class="btn btn-primary" data-action="open-add-item">+ Add item</button>';
   const isAllActive = ui.kitchenLoc==='All' && ui.kitchenExpiry==='all';
@@ -2028,7 +2104,8 @@ function renderKitchen(){
     '<button class="pill-btn '+(ui.kitchenLoc===l?'active':'')+'" data-action="set-kitchen-loc" data-val="'+h(l)+'">'+h(l)+'</button>').join('');
   const expiryBtns=[{v:'expiring',l:'Expiring'},{v:'low',l:'Low stock'}].map(o=>
     '<button class="pill-btn '+(ui.kitchenExpiry===o.v?'active':'')+'" data-action="set-kitchen-expiry" data-val="'+o.v+'">'+o.l+'</button>').join('');
-  return '<div class="toolbar">'+
+  return renderLeftoversShelf()+
+  '<div class="toolbar">'+
     '<div class="search-box"><span class="search-icon">🔍</span>'+
       '<input id="kitchen-search" data-live="kitchen-search" value="'+h(ui.kitchenSearch)+'" placeholder="Search kitchen…">'+
     '</div>'+
@@ -2140,6 +2217,40 @@ function renderItemFormModal(){
         '<div class="form-actions">'+
           '<button type="button" class="btn btn-primary" data-action="save-item-rows">'+saveLabel+'</button>'+
           '<button type="button" class="btn btn-secondary" data-action="cancel-add-item">Cancel</button>'+
+        '</div>'+
+      '</div>'+
+    '</div>'
+  );
+}
+
+function renderLeftoverFormModal(){
+  const f=ui.leftoverFormModal;
+  const servingsStepper=
+    '<div style="display:flex;align-items:center;gap:10px;">'+
+      '<button type="button" class="qty-btn" data-action="adj-leftover-servings" data-delta="-1">−</button>'+
+      '<span style="font-size:16px;font-weight:800;min-width:80px;text-align:center;">'+f.servings+' serving'+(f.servings===1?'':'s')+'</span>'+
+      '<button type="button" class="qty-btn" data-action="adj-leftover-servings" data-delta="1">+</button>'+
+    '</div>';
+  const locBtns=LEFTOVER_LOCATIONS.map(l=>'<button type="button" class="pill-btn '+(f.location===l?'active':'')+'" data-action="set-leftover-location" data-val="'+l+'">'+l+'</button>').join('');
+  const chips=LEFTOVER_DURATION_PRESETS.map((p,pi)=>'<button type="button" class="pill-btn" style="font-size:11px;padding:4px 10px;" data-action="pick-leftover-duration" data-preset="'+pi+'">'+p.label+'</button>').join('');
+  const errorHtml=ui.leftoverFormError?'<div style="color:var(--orange);font-size:13px;font-weight:700;margin-bottom:10px;">'+h(ui.leftoverFormError)+'</div>':'';
+  return (
+    '<div class="modal-overlay" id="pp-modal-overlay">'+
+      '<div class="modal-sheet">'+
+        '<button class="modal-close" data-action="close-leftover-form">×</button>'+
+        '<div class="modal-title" style="margin-bottom:4px;">🍱 Save leftovers</div>'+
+        '<div style="font-size:13px;color:var(--ink-soft);font-weight:700;margin-bottom:16px;">'+h(f.title)+'</div>'+
+        '<div class="field" style="margin-bottom:16px;"><label>Servings left</label>'+servingsStepper+'</div>'+
+        '<div class="field" style="margin-bottom:16px;"><label>Store in</label><div style="display:flex;gap:8px;">'+locBtns+'</div></div>'+
+        '<div class="field" style="margin-bottom:8px;">'+
+          '<label>Goes bad in</label>'+
+          '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;">'+chips+'</div>'+
+          '<input type="date" value="'+h(f.expiresOn)+'" data-live="leftover-expires-on" style="max-width:180px;">'+
+        '</div>'+
+        errorHtml+
+        '<div class="form-actions">'+
+          '<button type="button" class="btn btn-primary" data-action="save-leftover">🍱 Save to kitchen</button>'+
+          '<button type="button" class="btn btn-secondary" data-action="close-leftover-form">Cancel</button>'+
         '</div>'+
       '</div>'+
     '</div>'
@@ -2641,7 +2752,7 @@ function renderHome(){
         :'<span style="color:var(--gold);">'+avail.have+'/'+avail.total+' ingredients in kitchen</span>'):'';
       const sideTag=cbEntry&&cbEntry.sideFor?'<span style="color:var(--ink-soft);font-weight:600;font-size:11px;" title="Side of '+h(cbEntry.sideFor)+'">🥗 </span>':'';
       return '<div style="margin-bottom:8px;">'+
-        '<div class="today-meal-name">'+sideTag+h(meal)+'</div>'+
+        '<div class="today-meal-name">'+sideTag+h(mealDisplayLabel(meal))+'</div>'+
         (availText?'<div class="today-meal-avail">'+availText+'</div>':'')+
         '<button class="today-cook-btn" data-action="open-cooking-mode" data-date="'+key+'" data-slot="'+h(slot)+'" data-meal="'+h(meal)+'">▶ Cook it</button>'+
       '</div>';
@@ -2656,7 +2767,7 @@ function renderHome(){
   }).join('');
 
   const expiring=state.inventory.filter(isExpiring);
-  const low=state.inventory.filter(i=>isLow(i)&&!isExpiring(i));
+  const low=state.inventory.filter(i=>isLow(i)&&!isExpiring(i)&&!i.isLeftover);
   const useToday=state.inventory.filter(i=>{
     if(!i.expiresOn) return false;
     const d=new Date(i.expiresOn+'T00:00:00'),t=new Date();t.setHours(0,0,0,0);
@@ -2808,9 +2919,51 @@ function renderCookingSidePanel(pairedTitle,pairedChecklist){
   '</div>';
 }
 
+function renderLeftoverEatModal(){
+  const{date,slot,meal,leftoverId}=ui.leftoverEatModal;
+  const item=state.inventory.find(i=>i.id===leftoverId);
+  const emoji=SLOT_EMOJI[slot]||'';
+  const titleText=item?item.sourceRecipeTitle:((leftoverMealInfo(meal)||{}).title||meal);
+  let body,footer;
+  if(!item){
+    body='<div class="cooking-body" style="text-align:center;padding:30px 22px;">'+
+      '<div style="font-size:44px;margin-bottom:12px;">🍽</div>'+
+      '<div style="font-size:14px;font-weight:700;color:var(--ink-soft);">This leftover is gone — it was already eaten or tossed.</div>'+
+    '</div>';
+    footer='<div class="cooking-footer">'+
+      '<button class="btn btn-secondary" data-action="clear-planner-meal" data-date="'+h(date)+'" data-slot="'+h(slot)+'" data-title="'+h(meal)+'">Remove from planner</button>'+
+      '<button class="btn btn-secondary" data-action="close-cooking-modal">Done</button>'+
+    '</div>';
+  } else {
+    const exp=item.expiresOn?expiryLabel(item.expiresOn):'';
+    const warn=isExpiring(item);
+    body='<div class="cooking-body" style="text-align:center;padding:26px 22px;">'+
+      '<div style="font-size:48px;margin-bottom:10px;">🍱</div>'+
+      '<div style="font-size:15px;font-weight:800;color:var(--ink);margin-bottom:6px;">'+h(item.sourceRecipeTitle)+'</div>'+
+      '<div style="font-size:13px;font-weight:700;color:var(--ink-soft);margin-bottom:2px;">'+item.quantity+' serving'+(item.quantity===1?'':'s')+' left · '+h(item.location)+'</div>'+
+      (exp?'<div style="font-size:13px;font-weight:700;color:'+(warn?'var(--orange)':'var(--ink-soft)')+';">'+exp+'</div>':'')+
+    '</div>';
+    footer='<div class="cooking-footer">'+
+      '<button class="btn btn-secondary" data-action="discard-leftover">🗑 Discard</button>'+
+      '<button class="btn btn-primary" data-action="eat-leftover">✅ Ate it</button>'+
+    '</div>';
+  }
+  return '<div class="cooking-overlay" id="pp-cooking-overlay">'+
+    '<div class="cooking-sheet">'+
+      '<div class="cooking-header">'+
+        '<button class="modal-close" data-action="close-cooking-modal" style="float:right;margin-top:-4px;">×</button>'+
+        '<div class="cooking-slot-label">'+emoji+' '+h(slot)+'</div>'+
+        '<div class="cooking-title">🍱 '+h(titleText)+'</div>'+
+      '</div>'+
+      body+footer+
+    '</div>'+
+  '</div>';
+}
+
 function renderCookingModal(){
   const root=document.getElementById('cooking-modal-root');
   if(!root) return;
+  if(ui.leftoverEatModal){root.innerHTML=renderLeftoverEatModal();return;}
   if(!ui.cookingModal){root.innerHTML='';return;}
 
   const{date,slot,meal,checklist,generating,generatedRecipe,error,pairedMeal,pairedChecklist}=ui.cookingModal;
@@ -2862,6 +3015,7 @@ function renderCookingModal(){
       :'<div class="cooking-body">'+mainContent+'</div>';
 
     footer='<div class="cooking-footer">'+footerBase+
+      '<button class="btn btn-secondary" data-action="open-save-leftovers" data-title="'+h(recipe.title)+'" data-servings="'+(recipe.servings||1)+'">🍱 Save leftovers</button>'+
       (!cbRecipe&&generatedRecipe?'<button class="btn btn-primary" data-action="save-generated-recipe">🔖 Save to cookbook</button>':'')+
     '</div>';
 
@@ -3021,7 +3175,7 @@ function renderPlanner(){
         const avail=cbEntry?recipeAvailability(cbEntry):null;
         const dot=avail&&avail.missing===0?'<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--green);margin-right:5px;flex-shrink:0;"></span>':'';
         const sideTag=cbEntry&&cbEntry.sideFor?'<span style="color:var(--ink-soft);font-weight:600;font-size:11px;" title="Side of '+h(cbEntry.sideFor)+'">🥗 </span>':'';
-        return '<button type="button" class="slot-meal-row" data-action="open-cooking-mode" data-date="'+key+'" data-slot="'+h(slot)+'" data-meal="'+h(meal)+'">'+dot+sideTag+h(meal)+'</button>';
+        return '<button type="button" class="slot-meal-row" data-action="open-cooking-mode" data-date="'+key+'" data-slot="'+h(slot)+'" data-meal="'+h(meal)+'">'+dot+sideTag+h(mealDisplayLabel(meal))+'</button>';
       }).join('');
       return '<div class="planner-slot planner-slot-filled">'+
         '<div class="slot-label">'+emoji+' '+slot+'</div>'+
@@ -3956,10 +4110,11 @@ document.addEventListener('click',e=>{
     ui.plannerModal=null;ui.plannerSearch='';ui.plannerShowCreate=false;
     ui.recipeViewModal=null;ui.assignModal=null;
     ui.showAddItem=false;ui.editingItemId=null;
+    ui.leftoverFormModal=null;ui.leftoverFormError='';
     renderModal();return;
   }
   if(e.target.id==='pp-cooking-overlay'){
-    ui.cookingModal=null;renderCookingModal();return;
+    ui.cookingModal=null;ui.leftoverEatModal=null;renderCookingModal();return;
   }
   const el=e.target.closest('[data-action]');if(!el)return;
   const a=el.dataset;
@@ -4057,6 +4212,35 @@ document.addEventListener('click',e=>{
       ui.assignModal=null;
       renderModal();
       break;
+    // leftovers
+    case 'open-save-leftovers':
+      ui.cookingModal=null;renderCookingModal();
+      ui.leftoverFormModal={title:a.title,servings:parseInt(a.servings)||1,location:'Fridge',expiresOn:addDurationToToday({days:3})};
+      ui.leftoverFormError='';
+      renderModal();
+      break;
+    case 'close-leftover-form': ui.leftoverFormModal=null;ui.leftoverFormError='';renderModal();break;
+    case 'adj-leftover-servings':
+      if(ui.leftoverFormModal){ui.leftoverFormModal.servings=Math.max(1,(Number(ui.leftoverFormModal.servings)||1)+Number(a.delta));renderModal();}
+      break;
+    case 'set-leftover-location': if(ui.leftoverFormModal){ui.leftoverFormModal.location=a.val;renderModal();}break;
+    case 'pick-leftover-duration':{
+      const preset=LEFTOVER_DURATION_PRESETS[Number(a.preset)];
+      if(ui.leftoverFormModal&&preset){ui.leftoverFormModal.expiresOn=addDurationToToday(preset);renderModal();}
+    }break;
+    case 'save-leftover': saveLeftover();break;
+    case 'open-assign-modal-for-leftover':{
+      const item=state.inventory.find(i=>i.id===a.id);
+      if(item) openAssignModalForLeftover(item);
+    }break;
+    case 'eat-leftover':{
+      const m=ui.leftoverEatModal;
+      if(m){const item=state.inventory.find(i=>i.id===m.leftoverId);if(item) eatLeftover(item,m.date,m.slot,m.meal);}
+    }break;
+    case 'discard-leftover':{
+      const m=ui.leftoverEatModal;
+      if(m){const item=state.inventory.find(i=>i.id===m.leftoverId);if(item) discardLeftover(item,m.date,m.slot,m.meal);}
+    }break;
     case 'plan-recipe-result':{
       const r=ui.recipes[Number(a.idx)];
       if(r){ saveRecipe(r); openAssignModalFor(r.title); }
@@ -4112,18 +4296,24 @@ document.addEventListener('click',e=>{
       commitPlannerMeal(a.date,a.slot,title);
     }break;
     case 'clear-planner-meal':
-      if(confirm('Remove "'+a.title+'" from '+a.slot+'?')) removePlannerMeal(a.date,a.slot,a.title);
+      if(confirm('Remove "'+mealDisplayLabel(a.title)+'" from '+a.slot+'?')) removePlannerMeal(a.date,a.slot,a.title);
       break;
     case 'planner-prev': ui.plannerWeekOffset--;render();break;
     case 'planner-next': ui.plannerWeekOffset++;render();break;
     case 'add-week-missing': addWeekMissingToGrocery();break;
     // cooking mode
-    case 'open-cooking-mode':
+    case 'open-cooking-mode':{
+      const leftoverInfo=leftoverMealInfo(a.meal);
+      if(leftoverInfo){
+        ui.leftoverEatModal={date:a.date,slot:a.slot,meal:a.meal,leftoverId:leftoverInfo.leftoverId};
+        renderCookingModal();break;
+      }
       ui.cookingModal={date:a.date,slot:a.slot,meal:a.meal,checklist:{},generating:false,generatedRecipe:null,error:'',
         pairedMeal:findPairedMealInSlot(a.date,a.slot,a.meal),pairedChecklist:{}};
-      renderCookingModal();break;
+      renderCookingModal();
+    }break;
     case 'close-cooking-modal':
-      ui.cookingModal=null;renderCookingModal();break;
+      ui.cookingModal=null;ui.leftoverEatModal=null;renderCookingModal();break;
     case 'toggle-cooking-ingredient':
       if(ui.cookingModal){ui.cookingModal.checklist[a.name]=!ui.cookingModal.checklist[a.name];renderCookingModal();}break;
     case 'toggle-cooking-side-ingredient':
@@ -4276,6 +4466,9 @@ document.addEventListener('input',e=>{
   else if(live==='browser-search'){
     ui.browserSearch=el.value;
     partialUpdate('recipe-browser-list', renderRecipeBrowserList());
+  }
+  else if(live==='leftover-expires-on'){
+    if(ui.leftoverFormModal) ui.leftoverFormModal.expiresOn=el.value;
   }
 });
 
