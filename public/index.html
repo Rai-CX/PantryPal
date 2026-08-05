@@ -800,19 +800,39 @@ function adjustQty(id,delta){
 // an image content block, so no backend change is needed for that path.
 const BARCODE_FORMATS=['ean_13','ean_8','upc_a','upc_e'];
 let barcodeDetectTimer=null;
+let zxingControls=null;
+// iOS (Safari, and every "other browser" on iOS — Apple requires them all to run
+// on WebKit) has no native BarcodeDetector. ZXing is a pure-JS decoder that works
+// from a live video element on any browser, so it's lazy-loaded from a CDN only
+// when the native API is missing — no build step in this app to bundle it normally.
+const ZXING_SRC='https://unpkg.com/@zxing/browser@0.2.1/umd/zxing-browser.min.js';
+let zxingLoadPromise=null;
+function loadZXing(){
+  if(window.ZXingBrowser) return Promise.resolve();
+  if(zxingLoadPromise) return zxingLoadPromise;
+  zxingLoadPromise=new Promise((resolve,reject)=>{
+    const s=document.createElement('script');
+    s.src=ZXING_SRC;
+    s.onload=()=>resolve();
+    s.onerror=()=>{zxingLoadPromise=null;reject(new Error('Could not load barcode scanner'));};
+    document.head.appendChild(s);
+  });
+  return zxingLoadPromise;
+}
 
 function openBarcodeScan(target){
-  const camSupported='BarcodeDetector' in window;
-  ui.barcodeScanModal={target,status:camSupported?'scanning':'manual',manualCode:'',err:''};
+  const nativeSupported='BarcodeDetector' in window;
+  ui.barcodeScanModal={target,status:nativeSupported?'scanning':'loading-scanner',manualCode:'',err:''};
   renderModal();
-  if(camSupported) startBarcodeCamera();
+  if(nativeSupported) startNativeBarcodeCamera();
+  else startZXingBarcodeCamera();
 }
 function closeBarcodeScan(){
   stopBarcodeCamera();
   ui.barcodeScanModal=null;
   renderModal();
 }
-async function startBarcodeCamera(){
+async function startNativeBarcodeCamera(){
   const video=document.getElementById('barcode-video');
   try{
     const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}});
@@ -835,8 +855,28 @@ async function startBarcodeCamera(){
     }
   }
 }
+async function startZXingBarcodeCamera(){
+  const video=document.getElementById('barcode-video');
+  try{
+    await loadZXing();
+    if(!ui.barcodeScanModal) return; // modal closed while the library was loading
+    ui.barcodeScanModal.status='scanning';renderModal();
+    video.style.display='block';
+    const reader=new ZXingBrowser.BrowserMultiFormatReader();
+    zxingControls=await reader.decodeFromConstraints({video:{facingMode:'environment'}},video,(result)=>{
+      if(result) handleBarcodeDetected(result.getText());
+    });
+  }catch(e){
+    if(ui.barcodeScanModal){
+      ui.barcodeScanModal.status='manual';
+      ui.barcodeScanModal.err='Couldn\'t start the camera scanner — you can still enter the barcode number below.';
+      renderModal();
+    }
+  }
+}
 function stopBarcodeCamera(){
   if(barcodeDetectTimer){clearInterval(barcodeDetectTimer);barcodeDetectTimer=null;}
+  if(zxingControls){zxingControls.stop();zxingControls=null;}
   const video=document.getElementById('barcode-video');
   if(video.srcObject){video.srcObject.getTracks().forEach(t=>t.stop());video.srcObject=null;}
   video.style.display='none';
@@ -2478,7 +2518,9 @@ function renderLeftoverFormModal(){
 function renderBarcodeScanModal(){
   const m=ui.barcodeScanModal;
   let body;
-  if(m.status==='scanning'){
+  if(m.status==='loading-scanner'){
+    body='<div class="status-card"><div class="spinner" style="margin:0 auto 12px;"></div>Loading scanner…</div>';
+  } else if(m.status==='scanning'){
     body='<div id="barcode-video-slot" style="margin-bottom:12px;"></div>'+
       '<p style="font-size:12.5px;color:var(--ink-soft);font-weight:700;text-align:center;margin-bottom:10px;">Point your camera at a barcode.</p>'+
       '<button type="button" class="btn-ghost" data-action="barcode-use-manual" style="display:block;margin:0 auto;">Enter the number instead</button>';
