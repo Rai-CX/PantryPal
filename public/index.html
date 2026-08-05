@@ -4969,6 +4969,13 @@ window.addEventListener('unhandledrejection',e=>{
 // the delegated data-change system, since it lives outside the templated regions.
 document.getElementById('photo-file-input').addEventListener('change',handlePhotoFileChosen);
 
+// iOS/WebKit requires getUserMedia to be requested very close to the tap that
+// triggered it — if the ZXing script is still downloading at that moment, the
+// delay can invalidate that "user gesture" and the camera request silently
+// fails (first scan attempt only; it then works once the library is cached).
+// Pre-loading it here in the background as soon as the app starts avoids that.
+if(!('BarcodeDetector' in window)) loadZXing().catch(()=>{});
+
 // ─── INIT ─────────────────────────────────────────────────────────────────
 boot();
 </script>
