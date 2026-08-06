@@ -518,9 +518,14 @@ async function loadState(){
   const data = await api('GET','state');
   if(data===null) return false;
   const isNewAccount = data.cookbook===undefined;
-  state.inventory = data.inventory || [];
-  state.grocery   = data.grocery || [];
-  state.cookbook  = data.cookbook || [];
+  state.inventory = (data.inventory || []).filter(Boolean);
+  state.grocery   = (data.grocery || []).filter(Boolean);
+  const rawCookbook = data.cookbook || [];
+  state.cookbook  = rawCookbook.filter(r=>r&&r.title);
+  // a malformed/null entry can end up saved (e.g. a broken AI recipe-gen response) —
+  // once dropped here, persist the cleaned list so the bad entry doesn't keep crashing
+  // every future load
+  if(state.cookbook.length!==rawCookbook.length) saveCookbook();
   state.planner   = data.planner || {};
   state.settings  = data.settings || defaultSettings();
   // back-fill any missing settings keys
@@ -723,7 +728,7 @@ function addDurationToToday(preset){
   if(preset.months) d.setMonth(d.getMonth()+preset.months);
   return dateKey(d);
 }
-const LEFTOVER_TAG_RE=/^🍱 (.+) \(leftover:([^)]+)\)$/;
+const LEFTOVER_TAG_RE=/^(?:🍱\s*)?(.+?)\s*\(leftover:([^)]+)\)$/;
 function leftoverMealInfo(meal){const m=LEFTOVER_TAG_RE.exec(meal||'');return m?{title:m[1],leftoverId:m[2]}:null;}
 function mealDisplayLabel(meal){const info=leftoverMealInfo(meal);return info?('🍱 '+info.title+' (leftover)'):meal;}
 function catTrackBy(catName){const c=getCat(catName);return c&&c.trackBy==='weight'?'weight':'count';}
@@ -3514,7 +3519,7 @@ async function generateRandomRecipes(){
     if(!Array.isArray(recipes)||!recipes.length) throw new Error('empty response');
     let added=0;
     recipes.forEach(r=>{
-      if(!r.title) return;
+      if(!r||!r.title) return;
       const dup=state.cookbook.some(cb=>cb.title.toLowerCase()===r.title.toLowerCase());
       if(!dup){
         const saved={...r,id:uid(),dateAdded:new Date().toISOString(),usesLowStock:[]};
@@ -4562,7 +4567,7 @@ async function findRecipes(){
     if(s>-1&&e>-1) text=text.slice(s,e+1);
     const recipes=JSON.parse(text);
     if(!Array.isArray(recipes)||!recipes.length) throw new Error('empty');
-    ui.recipes=recipes;ui.recipeStatus='done';
+    ui.recipes=recipes.filter(Boolean);ui.recipeStatus='done';
     noteCreditSpent();
   }catch(err){
     console.error(err);ui.recipeStatus='error';
