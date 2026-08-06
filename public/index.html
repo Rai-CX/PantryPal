@@ -3505,11 +3505,24 @@ async function generateRandomRecipes(){
   // regardless of which tab is currently showing
   render();
 
-  const existing=state.cookbook.slice(0,40).map(r=>r.title).join(', ');
-  const system='You are a creative recipe generator for a home kitchen app. Generate exactly 6 diverse and practical recipes. Mix different cuisines, meal types, and difficulty levels. Avoid duplicating any of these existing recipes: '+existing+'. Respond ONLY with a raw JSON array of 6 recipe objects (no markdown, no fences): [{"title":string,"cuisine":string,"mealType":string,"totalTimeMinutes":number,"servings":number,"description":string,"spiceLevel":string,"ingredients":[{"name":string,"quantity":string,"have":false}],"steps":[string],"missingIngredients":[],"tags":[string]}]. Keep descriptions under 15 words. Keep steps to 4-6 imperative sentences each under 15 words. Include at least one Breakfast, one Lunch, and one Dinner recipe.';
+  const TARGET=6;
+  // The cookbook is typically 800+ titles (starter seed set + everything broadcast
+  // in from every other household), so a fixed first-40 slice barely scratches the
+  // surface — the model kept "discovering" recipes that already existed outside that
+  // slice, and they were silently dropped as duplicates. Bias toward the most
+  // recently added titles (most likely to get echoed back on an immediate follow-up
+  // click) plus a random sample of the rest, so each call actually gives the model
+  // real visibility into what to avoid.
+  const recent=state.cookbook.slice(-60);
+  const restPool=state.cookbook.slice(0,Math.max(0,state.cookbook.length-60));
+  const sample=restPool.slice().sort(()=>Math.random()-0.5).slice(0,140);
+  const existing=recent.concat(sample).map(r=>r.title).join(', ');
+  // Ask for a couple extra as a buffer against inevitable collisions, but only
+  // keep the first 6 genuinely-new ones so the user still gets what was promised.
+  const system='You are a creative recipe generator for a home kitchen app. Generate exactly 8 diverse and practical recipes. Mix different cuisines, meal types, and difficulty levels. Avoid duplicating any of these existing recipes: '+existing+'. Respond ONLY with a raw JSON array of 8 recipe objects (no markdown, no fences): [{"title":string,"cuisine":string,"mealType":string,"totalTimeMinutes":number,"servings":number,"description":string,"spiceLevel":string,"ingredients":[{"name":string,"quantity":string,"have":false}],"steps":[string],"missingIngredients":[],"tags":[string]}]. Keep descriptions under 15 words. Keep steps to 4-6 imperative sentences each under 15 words. Include at least one Breakfast, one Lunch, and one Dinner recipe.';
   try{
-    const data=await api('POST','generate-recipe',{max_tokens:4000,system,
-      messages:[{role:'user',content:'Generate 6 diverse home recipes I haven\'t tried yet.'}]});
+    const data=await api('POST','generate-recipe',{max_tokens:5500,system,
+      messages:[{role:'user',content:'Generate 8 diverse home recipes I haven\'t tried yet.'}]});
     if(!data) throw new Error('request failed');
     let text=(data.content||[]).find(b=>b.type==='text')?.text||'';
     text=text.trim().replace(/^```json/i,'').replace(/^```/,'').replace(/```$/,'').trim();
@@ -3518,8 +3531,9 @@ async function generateRandomRecipes(){
     const recipes=JSON.parse(text);
     if(!Array.isArray(recipes)||!recipes.length) throw new Error('empty response');
     let added=0;
-    recipes.forEach(r=>{
-      if(!r||!r.title) return;
+    for(const r of recipes){
+      if(added>=TARGET) break;
+      if(!r||!r.title) continue;
       const dup=state.cookbook.some(cb=>cb.title.toLowerCase()===r.title.toLowerCase());
       if(!dup){
         const saved={...r,id:uid(),dateAdded:new Date().toISOString(),usesLowStock:[]};
@@ -3527,7 +3541,8 @@ async function generateRandomRecipes(){
         shareRecipe(saved);
         added++;
       }
-    });
+    }
+    if(added===0) throw new Error('all duplicates');
     saveCookbook();
     ui.generatingRandom=false;
     noteCreditSpent(2);
