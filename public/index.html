@@ -638,6 +638,7 @@ let ui={
   recipeStatus:'idle', recipes:[], recipeError:'',
   // cookbook
   cbSearch:'', cbMealFilter:'All', cbCanMake:false, cbFav:false, showAddCookbook:false,
+  cbCuisine:'All', cbServings:'All', cbSpice:'All',
   // planner
   plannerWeekOffset:0, plannerModal:null, // {date,slot}
   plannerSearch:'', plannerShowCreate:false, plannerMealFilter:'All', plannerShowLimit:40,
@@ -2148,9 +2149,31 @@ function renderChooseRecipeModal(){
   );
 }
 
+// Best-effort scaling of a free-text ingredient quantity ("1 1/2 cups", "3/4 cup",
+// "100g", "2") by a serving-size ratio. Only the leading number is touched — anything
+// after it (unit, descriptive text) is left exactly as-is. Strings with no leading
+// number ("pinch", "to taste") are returned unchanged.
+function scaleQuantity(qty,ratio){
+  if(!qty||!ratio||ratio===1) return qty;
+  let m=qty.match(/^(\d+)\s+(\d+)\/(\d+)/); // mixed fraction, e.g. "1 1/2"
+  let value;
+  if(m){
+    value=Number(m[1])+Number(m[2])/Number(m[3]);
+  } else if(m=qty.match(/^(\d+)\/(\d+)/)){ // simple fraction, e.g. "3/4"
+    value=Number(m[1])/Number(m[2]);
+  } else if(m=qty.match(/^\d+(\.\d+)?/)){ // plain int/decimal, e.g. "100" or "1.5"
+    value=Number(m[0]);
+  } else {
+    return qty;
+  }
+  const scaled=parseFloat((value*ratio).toFixed(2));
+  return scaled+qty.slice(m[0].length);
+}
 function renderRecipeViewModal(){
-  const {recipe:r,large}=ui.recipeViewModal;
+  const {recipe:r,large,scaledServings}=ui.recipeViewModal;
   const avail=recipeAvailability(r);
+  const servings=scaledServings||r.servings||1;
+  const ratio=r.servings?servings/r.servings:1;
 
   let availBar='';
   if(avail){
@@ -2173,10 +2196,10 @@ function renderRecipeViewModal(){
     ingSection='<div style="margin:14px 0 6px;"><div style="font-size:11px;font-weight:900;text-transform:uppercase;letter-spacing:.04em;color:var(--ink-soft);margin-bottom:6px;">Ingredients</div>'+
       '<ul class="ing-list">'+avail.items.map(i=>
         '<li><span class="'+(i.have?'ing-have':'ing-miss')+'">'+(i.have?'✓':'·')+'</span> '+
-        h(i.name)+(i.quantity?' <span style="color:var(--ink-soft);font-size:11px;">'+h(i.quantity)+'</span>':'')+
+        h(i.name)+(i.quantity?' <span style="color:var(--ink-soft);font-size:11px;">'+h(scaleQuantity(i.quantity,ratio))+'</span>':'')+
         '</li>').join('')+'</ul></div>';
   } else if(r.ingredients&&r.ingredients.length){
-    ingSection='<div style="margin:14px 0 6px;"><ul class="ing-list">'+r.ingredients.map(i=>'<li>'+h(i.name||i)+(i.quantity?' <span style="color:var(--ink-soft);font-size:11px;">'+h(i.quantity)+'</span>':'')+'</li>').join('')+'</ul></div>';
+    ingSection='<div style="margin:14px 0 6px;"><ul class="ing-list">'+r.ingredients.map(i=>'<li>'+h(i.name||i)+(i.quantity?' <span style="color:var(--ink-soft);font-size:11px;">'+h(scaleQuantity(i.quantity,ratio))+'</span>':'')+'</li>').join('')+'</ul></div>';
   }
   const stepsSection=r.steps&&r.steps.length
     ?'<div style="margin:10px 0;"><div style="font-size:11px;font-weight:900;text-transform:uppercase;letter-spacing:.04em;color:var(--ink-soft);margin-bottom:6px;">Steps</div>'+
@@ -2206,7 +2229,14 @@ function renderRecipeViewModal(){
         (r.description?'<div style="font-size:13.5px;color:var(--ink-soft);margin-bottom:8px;line-height:1.4;">'+h(r.description)+'</div>':'')+
         '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">'+
           (r.totalTimeMinutes?'<span style="font-size:12px;color:var(--ink-soft);font-weight:700;">⏱ '+r.totalTimeMinutes+' min</span>':'')+
-          (r.servings?'<span style="font-size:12px;color:var(--ink-soft);font-weight:700;">👤 '+r.servings+'</span>':'')+
+          (r.servings?(
+            '<span class="qty-row" style="font-size:12px;color:var(--ink-soft);font-weight:700;">👤 '+
+              '<button type="button" class="qty-btn" data-action="adj-recipe-view-servings" data-delta="-1">−</button>'+
+              '<span class="qty-val">'+servings+'</span>'+
+              '<button type="button" class="qty-btn" data-action="adj-recipe-view-servings" data-delta="1">+</button>'+
+              (ratio!==1?'<span style="font-weight:600;">(adjusted from '+r.servings+')</span>':'')+
+            '</span>'
+          ):'')+
           spiceBadge+
         '</div>'+
         availBar+ratingRow+ingSection+stepsSection+
@@ -2971,6 +3001,9 @@ function cookbookFiltered(invIndex){
       ||(r.ingredients||[]).some(i=>(i.name||String(i)).toLowerCase().includes(q)));
   }
   if(ui.cbMealFilter!=='All') books=books.filter(r=>r.mealType===ui.cbMealFilter);
+  if(ui.cbCuisine!=='All') books=books.filter(r=>r.cuisine===ui.cbCuisine);
+  if(ui.cbServings!=='All') books=books.filter(r=>Number(r.servings)===Number(ui.cbServings));
+  if(ui.cbSpice!=='All') books=books.filter(r=>r.spiceLevel===ui.cbSpice);
   if(ui.cbCanMake){
     const idx=invIndex||buildInvLowerIndex();
     books=books.filter(r=>{ const a=recipeAvailability(r,idx); return !a||a.missing===0; });
@@ -3027,6 +3060,33 @@ function renderCookbook(){
     '<button class="pill-btn '+(ui.cbMealFilter===m?'active':'')+'" data-action="set-cb-meal" data-val="'+m+'">'+m+'</button>').join('');
   const canMakeBtn='<button class="pill-btn '+(ui.cbCanMake?'active':'')+'" data-action="toggle-cb-can-make">✅ Can make now</button>';
   const favBtn='<button class="pill-btn '+(ui.cbFav?'active':'')+'" data-action="toggle-cb-fav">⭐ Favorites</button>';
+  // Filter options are derived from what's actually in the cookbook, not from
+  // state.settings.cuisines — that list is user-editable and routinely missing
+  // most of the cuisines real recipes (seeded or AI-generated) actually carry.
+  const servingOpts=[...new Set(state.cookbook.map(r=>r.servings).filter(Boolean))].sort((a,b)=>a-b);
+  const servingBtns=servingOpts.length?['All',...servingOpts].map(s=>
+    '<button class="pill-btn '+(String(ui.cbServings)===String(s)?'active':'')+'" data-action="set-cb-servings" data-val="'+s+'">'+(s==='All'?'All servings':'👤 '+s)+'</button>').join(''):'';
+  const spiceOpts=['Mild','Medium','Hot'].filter(s=>state.cookbook.some(r=>r.spiceLevel===s));
+  const spiceBtns=spiceOpts.length?['All',...spiceOpts].map(s=>
+    '<button class="pill-btn '+(ui.cbSpice===s?'active':'')+'" data-action="set-cb-spice" data-val="'+s+'">'+(s==='All'?'All spice':'🌶 '+s)+'</button>').join(''):'';
+  const cuisineOpts=[...new Set(state.cookbook.map(r=>r.cuisine).filter(Boolean))].sort();
+  const cuisineSelect=cuisineOpts.length?(
+    '<select data-change="cb-cuisine" style="border:1.5px solid var(--border);border-radius:999px;padding:9px 14px;font-size:13px;font-weight:700;background:var(--card);color:var(--ink);">'+
+      ['All',...cuisineOpts].map(c=>'<option value="'+h(c)+'" '+(ui.cbCuisine===c?'selected':'')+'>'+h(c)+'</option>').join('')+
+    '</select>'
+  ):'';
+  const ingredientChips=(ui.cookFilters.ingredients||[]).map(ing=>
+    '<span class="pill-btn active" style="display:inline-flex;align-items:center;gap:6px;">'+h(ing)+
+      '<button type="button" data-action="remove-cook-ingredient" data-val="'+h(ing)+'" style="background:none;border:none;color:inherit;cursor:pointer;font-weight:900;padding:0;">×</button>'+
+    '</span>'
+  ).join('');
+  const ingredientRow='<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:16px;">'+
+    ingredientChips+
+    '<form data-form="add-cb-ingredient" style="display:flex;gap:6px;">'+
+      '<input id="cb-ingredient-input" name="ingredient" placeholder="Filter by ingredient…" autocomplete="off" style="font-size:12.5px;padding:8px 12px;border:1.5px solid var(--border);border-radius:999px;width:170px;">'+
+      '<button type="submit" class="btn btn-secondary" style="font-size:12px;padding:7px 13px;">+ Add</button>'+
+    '</form>'+
+  '</div>';
   return '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;flex-wrap:wrap;">'+
     '<div style="font-family:\'Bitter\',serif;font-size:20px;font-weight:700;flex:1;">📖 Cookbook</div>'+
     '<button class="btn btn-secondary" data-action="open-add-cookbook">+ Add recipe</button>'+
@@ -3040,8 +3100,10 @@ function renderCookbook(){
     '<div class="search-box" style="flex:1;"><span class="search-icon">🔍</span>'+
       '<input id="cb-search-input" data-live="cb-search" value="'+h(ui.cbSearch)+'" placeholder="Search cookbook…">'+
     '</div>'+
+    cuisineSelect+
   '</div>'+
-  '<div class="pill-filters" style="margin-bottom:16px;">'+mealFilterBtns+canMakeBtn+favBtn+'</div>'+
+  '<div class="pill-filters" style="margin-bottom:16px;">'+mealFilterBtns+canMakeBtn+favBtn+servingBtns+spiceBtns+'</div>'+
+  ingredientRow+
   (ui.showAddCookbook?renderAddCookbookForm():'')+
   '<div id="cookbook-cards">'+renderCookbookCards(invIdx)+'</div>';
 }
@@ -4620,6 +4682,8 @@ document.addEventListener('click',e=>{
     case 'set-cb-meal': ui.cbMealFilter=a.val;ui.cbShowLimit=30;render();break;
     case 'toggle-cb-can-make': ui.cbCanMake=!ui.cbCanMake;ui.cbShowLimit=30;render();break;
     case 'toggle-cb-fav': ui.cbFav=!ui.cbFav;ui.cbShowLimit=30;render();break;
+    case 'set-cb-servings': ui.cbServings=a.val;ui.cbShowLimit=30;render();break;
+    case 'set-cb-spice': ui.cbSpice=a.val;ui.cbShowLimit=30;render();break;
     case 'cookbook-show-more': ui.cbShowLimit=(ui.cbShowLimit||30)+30; partialUpdate('cookbook-cards', renderCookbookCards()); break;
     case 'toggle-cb-fav-item':{const r=state.cookbook.find(x=>x.id===a.id);if(r){r.favorite=!r.favorite;saveCookbook();render();}}break;
     case 'rate-recipe':{const r=state.cookbook.find(x=>x.id===a.id);if(r){r.rating=Number(a.val);saveCookbook();render();}}break;
@@ -4628,9 +4692,13 @@ document.addEventListener('click',e=>{
     // recipe view modal (used from the cookbook and the planner's recipe browser)
     case 'open-recipe-view':{
       const r=state.cookbook.find(x=>x.id===a.id);
-      if(r){ ui.assignModal=null; ui.recipeViewModal={recipe:r,large:false}; renderModal(); }
+      if(r){ ui.assignModal=null; ui.recipeViewModal={recipe:r,large:false,scaledServings:r.servings||1}; renderModal(); }
     }break;
     case 'close-recipe-view': ui.recipeViewModal=null; renderModal(); break;
+    case 'adj-recipe-view-servings':
+      if(ui.recipeViewModal) ui.recipeViewModal.scaledServings=Math.max(1,(Number(ui.recipeViewModal.scaledServings)||1)+Number(a.delta));
+      renderModal();
+      break;
     case 'view-family-data': viewFamilyData(Number(a.id),a.name); break;
     case 'open-admin-delete-family':
       ui.adminDeleteFamilyModal={id:Number(a.id),name:a.name,loading:false,err:''};
@@ -4941,6 +5009,7 @@ document.addEventListener('change',e=>{
   else if(ch==='grocery-store-filter'){ui.groceryStore=el.value;render();}
   else if(ch==='cook-meal'){ui.cookFilters.mealType=el.value;}
   else if(ch==='cook-cuisine'){ui.cookFilters.cuisine=el.value;render();}
+  else if(ch==='cb-cuisine'){ui.cbCuisine=el.value;ui.cbShowLimit=30;render();}
   else if(ch==='cook-time'){ui.cookFilters.maxTime=el.value;}
   else if(ch==='cook-prefer-have'){ui.cookFilters.preferHave=el.checked;}
   else if(ch==='row-cat'){
@@ -4959,7 +5028,7 @@ document.addEventListener('submit',e=>{
   e.preventDefault();
   const form=e.target.closest('[data-form]');if(!form)return;
   const fd=new FormData(form);
-  if(form.dataset.form==='add-cook-ingredient'){
+  if(form.dataset.form==='add-cook-ingredient'||form.dataset.form==='add-cb-ingredient'){
     const val=(fd.get('ingredient')||'').trim();
     if(val&&!ui.cookFilters.ingredients.some(x=>x.toLowerCase()===val.toLowerCase())) ui.cookFilters.ingredients.push(val);
     render();
