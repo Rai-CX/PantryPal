@@ -2762,11 +2762,8 @@ function renderGroceryBody(){
   if(ui.showChecked&&checked.length>0){
     body+='<div class="shelf-header" style="margin-top:18px;">'+
       '<span class="shelf-tag" style="background:#E2DDD0;color:#9A8A78;">✓ Picked up</span>'+
-      '<button class="btn-ghost" data-action="restock-checked" style="color:var(--green);font-weight:800;">🧺 Add '+checked.length+' to kitchen</button>'+
       '<button class="btn-ghost" data-action="clear-checked">Clear all</button>'+
-    '</div>'+
-    (ui.restockMessage?'<div style="font-size:12px;font-weight:700;color:var(--green);background:var(--green-soft);border-radius:8px;padding:8px 12px;margin:8px 0;">'+h(ui.restockMessage)+'</div>':'')+
-    checked.map(g=>renderGroceryRow(g)).join('');
+    '</div>'+checked.map(g=>renderGroceryRow(g)).join('');
   }
   return body;
 }
@@ -2812,8 +2809,10 @@ function renderGrocery(){
     '</div>'+
     '<select class="g-input" style="border-radius:9px;padding:8px 12px;font-size:13px;" data-change="grocery-store-filter">'+storeOpts+'</select>'+
     '<button class="print-btn" data-action="toggle-show-checked">'+h(showCheckedLabel)+'</button>'+
+    (doneCount>0?'<button class="print-btn" data-action="restock-checked" style="color:var(--green);border-color:var(--green);">🧺 Add '+doneCount+' to kitchen</button>':'')+
     printBtn+shareBtn+
   '</div>'+
+  (ui.restockMessage?'<div style="font-size:12px;font-weight:700;color:var(--green);background:var(--green-soft);border-radius:8px;padding:8px 12px;margin-bottom:14px;">'+h(ui.restockMessage)+'</div>':'')+
   quickAdd+(ui.showAddGrocery?renderGroceryForm():'')+
   '<div id="grocery-list-body">'+renderGroceryBody()+'</div>';
 }
