@@ -123,6 +123,7 @@ input::placeholder,textarea::placeholder{color:var(--ink-soft);}
 .g-row{display:flex;align-items:flex-start;gap:10px;background:var(--card);border:1px solid var(--border);border-left:4px solid var(--border);border-radius:var(--r);padding:10px 12px;margin-bottom:7px;}
 .g-row.done{opacity:.55;}
 .g-row.done .g-name{text-decoration:line-through;color:var(--ink-soft);}
+.g-row.skipped{opacity:.7;}
 .check-circle{width:24px;height:24px;border-radius:50%;border:2.5px solid var(--green);background:var(--card);cursor:pointer;flex-shrink:0;margin-top:1px;position:relative;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:900;color:transparent;transition:background .1s,color .1s;}
 .check-circle.checked{background:var(--green);color:#fff;}
 .g-main{flex:1;min-width:0;}
@@ -634,6 +635,7 @@ let ui={
   // grocery
   grocerySearch:'', groceryGroup:'category', groceryStore:'All', showChecked:false,
   showAddGrocery:false, groceryQuickCat:'Other', groceryQuickCatBg:'#E2DCCB', groceryQuickCatColor:'#6B7160', groceryQuickEmoji:'📦',
+  groceryQuickTrackInKitchen:true,
   restockMessage:'',
   // cook
   cookFilters:{mealType:'Any',cuisine:'Any',customCuisine:'',maxTime:'any',preferHave:false,notes:'',ingredients:[]},
@@ -1088,59 +1090,78 @@ async function identifyItemFromPhoto(base64){
 // ─── ACTIONS: GROCERY ─────────────────────────────────────────────────────
 const PRIORITY_ORDER={high:0,normal:1,low:2};
 function byPriorityThenName(a,b){
-  return (PRIORITY_ORDER[a.priority||'normal']-PRIORITY_ORDER[b.priority||'normal'])||a.name.localeCompare(b.name);
+  return ((a.skipped?1:0)-(b.skipped?1:0))||(PRIORITY_ORDER[a.priority||'normal']-PRIORITY_ORDER[b.priority||'normal'])||a.name.localeCompare(b.name);
 }
-function addGroceryItem(name,category,note,fromLowStock,quantity,store,priority){
+function addGroceryItem(name,category,note,fromLowStock,quantity,store,priority,trackInKitchen){
   if(!name.trim()) return false;
   const dup=state.grocery.some(g=>!g.checked&&g.name.toLowerCase()===name.toLowerCase());
   if(dup) return false;
   state.grocery.push({id:uid(),name:name.trim(),category:category||'Other',note:note||'',
-    checked:false,fromLowStock:!!fromLowStock,quantity:quantity||'',store:store||'',
-    priority:priority||(fromLowStock?'high':'normal')});
+    checked:false,skipped:false,fromLowStock:!!fromLowStock,quantity:quantity||'',store:store||'',
+    priority:priority||(fromLowStock?'high':'normal'),trackInKitchen:trackInKitchen!==false});
   saveGrocery();return true;
 }
-function toggleChecked(id){const g=state.grocery.find(x=>x.id===id);if(g){g.checked=!g.checked;ui.restockMessage='';saveGrocery();render();}}
 function deleteGrocery(id){state.grocery=state.grocery.filter(g=>g.id!==id);saveGrocery();render();}
 function clearChecked(){state.grocery=state.grocery.filter(g=>!g.checked);ui.restockMessage='';saveGrocery();render();}
-// Moves checked-off grocery items straight into the kitchen instead of just
-// deleting them — buying milk and stocking the kitchen with milk are the same
-// real-world action, so this closes that gap in one tap.
+// Migrates a single grocery item into the kitchen: bumps an existing item's
+// quantity by one if exactly one name-match exists (parsing the grocery list's
+// free-text quantity against a structured kitchen unit isn't reliable — e.g.
+// inventory tracks eggs as {quantity:1,unit:'dozen'}, grocery says "18ct"), or
+// creates a new row seeded from remembered defaults, a matching existing item
+// (ambiguous when there's more than one), or a cold guess as last resort.
+function migrateGroceryItemToKitchen(g){
+  const nameLower=g.name.trim().toLowerCase();
+  const matches=state.inventory.filter(i=>i.name.trim().toLowerCase()===nameLower);
+  if(matches.length===1){
+    matches[0].quantity=(Number(matches[0].quantity)||0)+1;
+    return 'merged';
+  }
+  const def=state.itemDefaults[nameLower];
+  const seed=def||matches[0]||null;
+  const newItem={
+    id:uid(),name:g.name.trim(),
+    category:seed?seed.category:guessCategory(g.name),
+    location:seed?seed.location:'Fridge',
+    quantity:parseFloat(g.quantity)||1,
+    unit:seed?seed.unit:'',
+    threshold:seed?seed.threshold:0,
+    expiresOn:'',expiryMode:undefined,
+    emoji:seed?seed.emoji:guessItemEmoji(g.name)
+  };
+  state.inventory.push(newItem);
+  rememberItemDefaults(newItem);
+  return def?'known':'guessed';
+}
+// Checking an item off means "I bought this for the kitchen" — migrate it
+// immediately instead of waiting for a separate batch action, unless it's been
+// marked as not a kitchen item (trackInKitchen:false, e.g. paper towels).
+function toggleChecked(id){
+  const g=state.grocery.find(x=>x.id===id);
+  if(!g) return;
+  ui.restockMessage='';
+  if(g.checked){ g.checked=false; saveGrocery(); render(); return; }
+  g.checked=true; g.skipped=false;
+  if(g.trackInKitchen===false){ saveGrocery(); render(); return; }
+  const result=migrateGroceryItemToKitchen(g);
+  state.grocery=state.grocery.filter(x=>x.id!==id);
+  saveInv();saveGrocery();saveItemDefaults();
+  ui.restockMessage=result==='guessed'
+    ?'"'+g.name+'" added to kitchen — check its category.'
+    :'"'+g.name+'" added to kitchen.';
+  render();
+}
+// Fallback for checked items that never got auto-migrated above (e.g. checked
+// off before this feature existed) — trackInKitchen:false items are left alone
+// for "Clear all" to handle, since they were never meant to reach the kitchen.
 function restockCheckedToKitchen(){
-  const checked=state.grocery.filter(g=>g.checked);
+  const checked=state.grocery.filter(g=>g.checked&&g.trackInKitchen!==false);
   if(!checked.length) return;
   let merged=0,known=0,guessed=0;
   checked.forEach(g=>{
-    const nameLower=g.name.trim().toLowerCase();
-    const matches=state.inventory.filter(i=>i.name.trim().toLowerCase()===nameLower);
-    if(matches.length===1){
-      // Only safe universal signal across a loose grocery-quantity string and a
-      // structured kitchen unit is "one more of the thing you're already tracking" —
-      // parsing the grocery quantity and adding it risks corrupting the count
-      // (e.g. inventory tracks eggs as {quantity:1,unit:'dozen'}, grocery says "18ct").
-      matches[0].quantity=(Number(matches[0].quantity)||0)+1;
-      merged++;
-    } else {
-      // 0 matches (new item) or 2+ matches (ambiguous — same name can legitimately
-      // exist in both Fridge and Freezer, and grocery items carry no location) both
-      // create a fresh row rather than guess which existing one to touch.
-      const def=state.itemDefaults[nameLower];
-      const seed=def||matches[0]||null;
-      const newItem={
-        id:uid(),name:g.name.trim(),
-        category:seed?seed.category:guessCategory(g.name),
-        location:seed?seed.location:'Fridge',
-        quantity:parseFloat(g.quantity)||1,
-        unit:seed?seed.unit:'',
-        threshold:seed?seed.threshold:0,
-        expiresOn:'',expiryMode:undefined,
-        emoji:seed?seed.emoji:guessItemEmoji(g.name)
-      };
-      state.inventory.push(newItem);
-      rememberItemDefaults(newItem);
-      if(def) known++; else guessed++;
-    }
+    const result=migrateGroceryItemToKitchen(g);
+    if(result==='merged') merged++; else if(result==='known') known++; else guessed++;
   });
-  state.grocery=state.grocery.filter(g=>!g.checked);
+  state.grocery=state.grocery.filter(g=>!(g.checked&&g.trackInKitchen!==false));
   saveInv();saveGrocery();saveItemDefaults();
   const total=merged+known+guessed;
   ui.restockMessage=guessed>0
@@ -2783,6 +2804,7 @@ function renderGrocery(){
     '<span class="cat-preview" id="grocery-cat-preview" style="background:'+catGuessBg+';color:'+catGuessColor+';">'+h(catGuessName)+'</span>'+
     '<input id="grocery-quick-qty" class="g-input" placeholder="qty" style="width:70px;" data-live="grocery-quick-qty">'+
     '<input id="grocery-quick-store" class="g-input" list="store-dl" placeholder="store" style="width:110px;" data-live="grocery-quick-store">'+
+    '<button type="button" class="pill-btn '+(ui.groceryQuickTrackInKitchen!==false?'active':'')+'" data-action="toggle-quick-track-kitchen" title="'+(ui.groceryQuickTrackInKitchen!==false?'Adds to kitchen when checked off':'Won\'t be added to kitchen when checked off')+'">🍽</button>'+
     '<button class="btn btn-primary" data-action="quick-add-grocery-form" style="padding:8px 14px;">Add</button>'+
   '</div>'+
   '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;">'+
@@ -2883,7 +2905,7 @@ function renderGroceryRow(g){
   const priOptions=['high','normal','low'].map(p=>
     '<option value="'+p+'" '+(p===pri?'selected':'')+'>'+PRIORITY_STYLE[p].label+'</option>'
   ).join('');
-  return '<div class="g-row '+(g.checked?'done':'')+'" style="border-left-color:'+cat.color+';" id="grow-'+g.id+'">'+
+  return '<div class="g-row '+(g.checked?'done':'')+' '+(g.skipped?'skipped':'')+'" style="border-left-color:'+cat.color+';" id="grow-'+g.id+'">'+
     '<button class="check-circle '+(g.checked?'checked':'')+'" data-action="toggle-checked" data-id="'+g.id+'">'+
       (g.checked?'✓':'')+'</button>'+
     '<div class="g-main">'+
@@ -2906,6 +2928,7 @@ function renderGroceryRow(g){
         '</select>'+
       '</div>'+
     '</div>'+
+    (g.checked?'':'<button class="btn-icon" data-action="toggle-skipped" data-id="'+g.id+'" title="'+(g.skipped?'Add back to this trip':'Skip this trip')+'" style="'+(g.skipped?'color:var(--gold);border-color:var(--gold);':'')+'">⏭</button>')+
     '<button class="btn-icon" data-action="delete-grocery" data-id="'+g.id+'">✕</button>'+
   '</div>';
 }
@@ -2920,6 +2943,7 @@ function renderGroceryForm(){
       '<div class="field"><label>Priority</label><select name="priority"><option value="normal">Normal</option><option value="high">🔴 High</option><option value="low">🟢 Low</option></select></div>'+
       '<div class="field"><label>Note</label><input name="note" placeholder="brand, size…"></div>'+
     '</div>'+
+    '<label class="check-option"><input type="checkbox" name="trackInKitchen" checked> 🍽 Add to kitchen when checked off</label>'+
     '<div class="form-actions">'+
       '<button type="submit" class="btn btn-primary">Add to list</button>'+
       '<button type="button" class="btn btn-secondary" data-action="close-add-grocery">Cancel</button>'+
@@ -4697,18 +4721,21 @@ document.addEventListener('click',e=>{
     case 'set-kitchen-expiry': ui.kitchenExpiry=a.val;ui.kitchenLoc='All';render();break;
     // grocery
     case 'toggle-checked': toggleChecked(a.id);break;
+    case 'toggle-skipped':{const g=state.grocery.find(x=>x.id===a.id);if(g){g.skipped=!g.skipped;if(g.skipped)g.checked=false;saveGrocery();render();}}break;
     case 'delete-grocery': deleteGrocery(a.id);break;
     case 'clear-checked': clearChecked();break;
     case 'restock-checked': restockCheckedToKitchen();break;
     case 'add-all-low-stock': addAllLowStock();break;
+    case 'toggle-quick-track-kitchen': ui.groceryQuickTrackInKitchen=!ui.groceryQuickTrackInKitchen; render(); break;
     case 'quick-add-grocery-form':{
       const qInput=document.getElementById('grocery-quick-input');
       const qQty=document.getElementById('grocery-quick-qty');
       const qStore=document.getElementById('grocery-quick-store');
       const name=(qInput?.value||'').trim();
-      if(name){addGroceryItem(name,ui.groceryQuickCat,'',false,qQty?.value||'',qStore?.value||'');saveGrocery();
+      if(name){addGroceryItem(name,ui.groceryQuickCat,'',false,qQty?.value||'',qStore?.value||'',null,ui.groceryQuickTrackInKitchen);saveGrocery();
         if(qInput)qInput.value='';if(qQty)qQty.value='';if(qStore)qStore.value='';
         ui.groceryQuickCat='Other';ui.groceryQuickCatBg='#E2DCCB';ui.groceryQuickCatColor='#6B7160';ui.groceryQuickEmoji='📦';
+        ui.groceryQuickTrackInKitchen=true;
         render();}
     }break;
     case 'close-add-grocery': ui.showAddGrocery=false;render();break;
@@ -5096,7 +5123,7 @@ document.addEventListener('submit',e=>{
     render();
   }
   else if(form.dataset.form==='add-grocery'){
-    addGroceryItem((fd.get('name')||'').trim(),fd.get('category')||'Other',(fd.get('note')||'').trim(),false,(fd.get('quantity')||'').trim(),(fd.get('store')||'').trim(),fd.get('priority')||'normal');
+    addGroceryItem((fd.get('name')||'').trim(),fd.get('category')||'Other',(fd.get('note')||'').trim(),false,(fd.get('quantity')||'').trim(),(fd.get('store')||'').trim(),fd.get('priority')||'normal',fd.get('trackInKitchen')!==null);
     ui.showAddGrocery=false;saveGrocery();render();
   }
   else if(form.dataset.form==='add-cookbook'){addManualRecipe(fd);}
