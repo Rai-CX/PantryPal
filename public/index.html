@@ -498,7 +498,7 @@ function defaultSettings(){
 }
 
 let state={
-  inventory:[],grocery:[],cookbook:[],planner:{},settings:{}
+  inventory:[],grocery:[],cookbook:[],planner:{},settings:{},itemDefaults:{}
 };
 
 async function loadState(){
@@ -514,6 +514,7 @@ async function loadState(){
   // every future load
   if(state.cookbook.length!==rawCookbook.length) saveCookbook();
   state.planner   = data.planner || {};
+  state.itemDefaults = data.itemDefaults || {};
   state.settings  = data.settings || defaultSettings();
   // back-fill any missing settings keys
   if(!state.settings.categories) state.settings.categories = DEFAULT_CATEGORIES.map(c=>({...c}));
@@ -575,7 +576,7 @@ async function syncSharedRecipes(){
 // So two people using the same household (e.g. both grocery shopping at once)
 // see each other's changes without a manual page reload.
 let syncTimer=null;
-const SYNC_STATE_KEYS=['inventory','grocery','cookbook','planner','settings'];
+const SYNC_STATE_KEYS=['inventory','grocery','cookbook','planner','settings','itemDefaults'];
 function startBackgroundSync(){
   if(syncTimer) return;
   syncTimer=setInterval(pollForUpdates,8000);
@@ -620,6 +621,7 @@ function saveGrocery(){persistState('grocery',state.grocery);}
 function saveCookbook(){persistState('cookbook',state.cookbook);}
 function savePlanner(){persistState('planner',state.planner);}
 function saveSettings(){persistState('settings',state.settings);}
+function saveItemDefaults(){persistState('itemDefaults',state.itemDefaults);}
 
 // ─── UI STATE ─────────────────────────────────────────────────────────────
 let ui={
@@ -632,6 +634,7 @@ let ui={
   // grocery
   grocerySearch:'', groceryGroup:'category', groceryStore:'All', showChecked:false,
   showAddGrocery:false, groceryQuickCat:'Other', groceryQuickCatBg:'#E2DCCB', groceryQuickCatColor:'#6B7160', groceryQuickEmoji:'📦',
+  restockMessage:'',
   // cook
   cookFilters:{mealType:'Any',cuisine:'Any',customCuisine:'',maxTime:'any',preferHave:false,notes:'',ingredients:[]},
   cookKitchenPickerOpen:false, cookKitchenPickerCat:null,
@@ -694,6 +697,13 @@ function guessCategory(name){
   if(!n.trim()) return 'Other';
   for(const cat of Object.keys(CAT_KEYWORDS)){if(CAT_KEYWORDS[cat].some(w=>n.includes(w))) return cat;}
   return 'Other';
+}
+// Remembers how this item was last categorized/located/tracked so a future
+// restock (e.g. from the grocery list) doesn't have to guess cold. Deliberately
+// excludes expiresOn/expiryMode — a stale remembered expiry date would misfire.
+function rememberItemDefaults(item){
+  state.itemDefaults[item.name.trim().toLowerCase()]=
+    {category:item.category,location:item.location,unit:item.unit,threshold:item.threshold,emoji:item.emoji};
 }
 function expiryLabel(dateStr){
   if(!dateStr) return '';
@@ -779,9 +789,10 @@ function saveItemRows(){
     } else {
       state.inventory.push(item);
     }
+    rememberItemDefaults(item);
   });
   ui.showAddItem=false;ui.editingItemId=null;ui.itemFormRows=[];ui.batchFormError='';
-  saveInv();render();
+  saveInv();saveItemDefaults();render();
 }
 function deleteItem(id){state.inventory=state.inventory.filter(i=>i.id!==id);saveInv();render();}
 function adjustQty(id,delta){
@@ -991,12 +1002,14 @@ function submitScanResult(){
   if(!name){ m.err='Name is required';renderModal();return; }
   if(m.target==='kitchen'){
     const unit=(document.getElementById('scan-result-unit')?.value||'').trim();
-    state.inventory.push({
+    const newItem={
       id:uid(),name,category:m.category,location:'Fridge',
       quantity:parseFloat(quantityRaw)||1,unit,threshold:0,
       expiresOn:'',expiryMode:undefined,emoji:m.emoji||null
-    });
-    saveInv();
+    };
+    state.inventory.push(newItem);
+    rememberItemDefaults(newItem);
+    saveInv();saveItemDefaults();
   } else {
     addGroceryItem(name,m.category,'',false,quantityRaw.trim());
   }
@@ -1086,9 +1099,55 @@ function addGroceryItem(name,category,note,fromLowStock,quantity,store,priority)
     priority:priority||(fromLowStock?'high':'normal')});
   saveGrocery();return true;
 }
-function toggleChecked(id){const g=state.grocery.find(x=>x.id===id);if(g){g.checked=!g.checked;saveGrocery();render();}}
+function toggleChecked(id){const g=state.grocery.find(x=>x.id===id);if(g){g.checked=!g.checked;ui.restockMessage='';saveGrocery();render();}}
 function deleteGrocery(id){state.grocery=state.grocery.filter(g=>g.id!==id);saveGrocery();render();}
-function clearChecked(){state.grocery=state.grocery.filter(g=>!g.checked);saveGrocery();render();}
+function clearChecked(){state.grocery=state.grocery.filter(g=>!g.checked);ui.restockMessage='';saveGrocery();render();}
+// Moves checked-off grocery items straight into the kitchen instead of just
+// deleting them — buying milk and stocking the kitchen with milk are the same
+// real-world action, so this closes that gap in one tap.
+function restockCheckedToKitchen(){
+  const checked=state.grocery.filter(g=>g.checked);
+  if(!checked.length) return;
+  let merged=0,known=0,guessed=0;
+  checked.forEach(g=>{
+    const nameLower=g.name.trim().toLowerCase();
+    const matches=state.inventory.filter(i=>i.name.trim().toLowerCase()===nameLower);
+    if(matches.length===1){
+      // Only safe universal signal across a loose grocery-quantity string and a
+      // structured kitchen unit is "one more of the thing you're already tracking" —
+      // parsing the grocery quantity and adding it risks corrupting the count
+      // (e.g. inventory tracks eggs as {quantity:1,unit:'dozen'}, grocery says "18ct").
+      matches[0].quantity=(Number(matches[0].quantity)||0)+1;
+      merged++;
+    } else {
+      // 0 matches (new item) or 2+ matches (ambiguous — same name can legitimately
+      // exist in both Fridge and Freezer, and grocery items carry no location) both
+      // create a fresh row rather than guess which existing one to touch.
+      const def=state.itemDefaults[nameLower];
+      const seed=def||matches[0]||null;
+      const newItem={
+        id:uid(),name:g.name.trim(),
+        category:seed?seed.category:guessCategory(g.name),
+        location:seed?seed.location:'Fridge',
+        quantity:parseFloat(g.quantity)||1,
+        unit:seed?seed.unit:'',
+        threshold:seed?seed.threshold:0,
+        expiresOn:'',expiryMode:undefined,
+        emoji:seed?seed.emoji:guessItemEmoji(g.name)
+      };
+      state.inventory.push(newItem);
+      rememberItemDefaults(newItem);
+      if(def) known++; else guessed++;
+    }
+  });
+  state.grocery=state.grocery.filter(g=>!g.checked);
+  saveInv();saveGrocery();saveItemDefaults();
+  const total=merged+known+guessed;
+  ui.restockMessage=guessed>0
+    ?'Added '+total+' to kitchen — '+guessed+' new, check '+(guessed===1?'its':'their')+' category.'
+    :'Added '+total+' to kitchen.';
+  render();
+}
 function addAllLowStock(){
   // Add both use-soon (expiring) and low-stock items to the grocery list
   const toAdd=[...state.inventory.filter(isExpiring),...state.inventory.filter(i=>isLow(i)&&!isExpiring(i))];
@@ -2703,8 +2762,11 @@ function renderGroceryBody(){
   if(ui.showChecked&&checked.length>0){
     body+='<div class="shelf-header" style="margin-top:18px;">'+
       '<span class="shelf-tag" style="background:#E2DDD0;color:#9A8A78;">✓ Picked up</span>'+
+      '<button class="btn-ghost" data-action="restock-checked" style="color:var(--green);font-weight:800;">🧺 Add '+checked.length+' to kitchen</button>'+
       '<button class="btn-ghost" data-action="clear-checked">Clear all</button>'+
-    '</div>'+checked.map(g=>renderGroceryRow(g)).join('');
+    '</div>'+
+    (ui.restockMessage?'<div style="font-size:12px;font-weight:700;color:var(--green);background:var(--green-soft);border-radius:8px;padding:8px 12px;margin:8px 0;">'+h(ui.restockMessage)+'</div>':'')+
+    checked.map(g=>renderGroceryRow(g)).join('');
   }
   return body;
 }
@@ -4638,6 +4700,7 @@ document.addEventListener('click',e=>{
     case 'toggle-checked': toggleChecked(a.id);break;
     case 'delete-grocery': deleteGrocery(a.id);break;
     case 'clear-checked': clearChecked();break;
+    case 'restock-checked': restockCheckedToKitchen();break;
     case 'add-all-low-stock': addAllLowStock();break;
     case 'quick-add-grocery-form':{
       const qInput=document.getElementById('grocery-quick-input');

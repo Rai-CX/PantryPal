@@ -46,7 +46,7 @@ const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 const stripe = STRIPE_SECRET_KEY ? require('stripe')(STRIPE_SECRET_KEY) : null;
 
-const STATE_KEYS = ['inventory', 'grocery', 'cookbook', 'planner', 'settings'];
+const STATE_KEYS = ['inventory', 'grocery', 'cookbook', 'planner', 'settings', 'itemDefaults'];
 const CREDIT_PACKS = {
   small:  { credits: 50,  amountCents: 500,  label: '50 credits — $5' },
   medium: { credits: 150, amountCents: 1200, label: '150 credits — $12' },
