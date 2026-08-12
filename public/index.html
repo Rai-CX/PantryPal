@@ -2804,7 +2804,7 @@ function renderGrocery(){
     '<span class="cat-preview" id="grocery-cat-preview" style="background:'+catGuessBg+';color:'+catGuessColor+';">'+h(catGuessName)+'</span>'+
     '<input id="grocery-quick-qty" class="g-input" placeholder="qty" style="width:70px;" data-live="grocery-quick-qty">'+
     '<input id="grocery-quick-store" class="g-input" list="store-dl" placeholder="store" style="width:110px;" data-live="grocery-quick-store">'+
-    '<button type="button" class="pill-btn '+(ui.groceryQuickTrackInKitchen!==false?'active':'')+'" data-action="toggle-quick-track-kitchen" title="'+(ui.groceryQuickTrackInKitchen!==false?'Adds to kitchen when checked off':'Won\'t be added to kitchen when checked off')+'">🍽</button>'+
+    '<button type="button" class="pill-btn '+(ui.groceryQuickTrackInKitchen!==false?'active':'')+'" data-action="toggle-quick-track-kitchen" title="'+(ui.groceryQuickTrackInKitchen!==false?'Adds to kitchen when checked off':'Won\'t be added to kitchen when checked off')+'">🍽️</button>'+
     '<button class="btn btn-primary" data-action="quick-add-grocery-form" style="padding:8px 14px;">Add</button>'+
   '</div>'+
   '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;">'+
@@ -2943,7 +2943,7 @@ function renderGroceryForm(){
       '<div class="field"><label>Priority</label><select name="priority"><option value="normal">Normal</option><option value="high">🔴 High</option><option value="low">🟢 Low</option></select></div>'+
       '<div class="field"><label>Note</label><input name="note" placeholder="brand, size…"></div>'+
     '</div>'+
-    '<label class="check-option"><input type="checkbox" name="trackInKitchen" checked> 🍽 Add to kitchen when checked off</label>'+
+    '<label class="check-option"><input type="checkbox" name="trackInKitchen" checked> 🍽️ Add to kitchen when checked off</label>'+
     '<div class="form-actions">'+
       '<button type="submit" class="btn btn-primary">Add to list</button>'+
       '<button type="button" class="btn btn-secondary" data-action="close-add-grocery">Cancel</button>'+
